@@ -300,22 +300,77 @@ fn detect_bg_from_osc11() -> Option<Color> {
     parse_osc11_rgb(&text)
 }
 
+fn base_color_rgb(base: BaseColor, light: bool) -> (u8, u8, u8) {
+    match (base, light) {
+        (BaseColor::Black, false) => (0, 0, 0),
+        (BaseColor::Black, true) => (96, 96, 96),
+        (BaseColor::Red, false) => (170, 0, 0),
+        (BaseColor::Red, true) => (255, 96, 96),
+        (BaseColor::Green, false) => (0, 170, 0),
+        (BaseColor::Green, true) => (96, 255, 96),
+        (BaseColor::Yellow, false) => (170, 85, 0),
+        (BaseColor::Yellow, true) => (255, 255, 96),
+        (BaseColor::Blue, false) => (0, 0, 170),
+        (BaseColor::Blue, true) => (96, 160, 255),
+        (BaseColor::Magenta, false) => (170, 0, 170),
+        (BaseColor::Magenta, true) => (255, 96, 255),
+        (BaseColor::Cyan, false) => (0, 170, 170),
+        (BaseColor::Cyan, true) => (96, 255, 255),
+        (BaseColor::White, false) => (170, 170, 170),
+        (BaseColor::White, true) => (255, 255, 255),
+    }
+}
+
+fn color_luma(color: Color) -> Option<u16> {
+    let (r, g, b) = match color {
+        Color::Dark(base) => base_color_rgb(base, false),
+        Color::Light(base) => base_color_rgb(base, true),
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::RgbLowRes(r, g, b) => {
+            let to_255 = |v: u8| -> u8 {
+                let clamped = v.min(5) as u16;
+                ((clamped * 255) / 5) as u8
+            };
+            (to_255(r), to_255(g), to_255(b))
+        }
+        Color::TerminalDefault => return None,
+    };
+
+    // ITU-R BT.709 luma approximation scaled to 0..255.
+    let luma = (2126u32 * r as u32 + 7152u32 * g as u32 + 722u32 * b as u32) / 10_000;
+    Some(luma as u16)
+}
+
+fn is_light_background(bg: Color) -> bool {
+    color_luma(bg).map(|l| l >= 145).unwrap_or(false)
+}
+
 fn apply_ui_theme(siv: &mut Cursive) {
     let mut theme = Theme::default();
     theme.shadow = false;
     theme.borders = BorderStyle::Simple;
 
     let bg = detect_terminal_background_color().unwrap_or(Color::Dark(BaseColor::Black));
+    let light_bg = is_light_background(bg);
 
     theme.palette[PaletteColor::Background] = bg;
     theme.palette[PaletteColor::View] = bg;
-    theme.palette[PaletteColor::Primary] = Color::Light(BaseColor::White);
-    theme.palette[PaletteColor::Secondary] = Color::Light(BaseColor::Cyan);
-    theme.palette[PaletteColor::TitlePrimary] = Color::Light(BaseColor::Cyan);
-    theme.palette[PaletteColor::TitleSecondary] = Color::Light(BaseColor::Green);
-    theme.palette[PaletteColor::Highlight] = Color::Dark(BaseColor::Cyan);
+    if light_bg {
+        theme.palette[PaletteColor::Primary] = Color::Dark(BaseColor::Black);
+        theme.palette[PaletteColor::Secondary] = Color::Dark(BaseColor::Blue);
+        theme.palette[PaletteColor::TitlePrimary] = Color::Dark(BaseColor::Blue);
+        theme.palette[PaletteColor::TitleSecondary] = Color::Dark(BaseColor::Green);
+        theme.palette[PaletteColor::Highlight] = Color::Dark(BaseColor::Blue);
+        theme.palette[PaletteColor::HighlightText] = Color::Light(BaseColor::White);
+    } else {
+        theme.palette[PaletteColor::Primary] = Color::Light(BaseColor::White);
+        theme.palette[PaletteColor::Secondary] = Color::Light(BaseColor::Cyan);
+        theme.palette[PaletteColor::TitlePrimary] = Color::Light(BaseColor::Cyan);
+        theme.palette[PaletteColor::TitleSecondary] = Color::Light(BaseColor::Green);
+        theme.palette[PaletteColor::Highlight] = Color::Dark(BaseColor::Cyan);
+        theme.palette[PaletteColor::HighlightText] = Color::Dark(BaseColor::Black);
+    }
     theme.palette[PaletteColor::HighlightInactive] = bg;
-    theme.palette[PaletteColor::HighlightText] = Color::Dark(BaseColor::Black);
 
     siv.set_theme(theme);
 }
@@ -1347,6 +1402,17 @@ fn save_parallel_jobs_from_settings(siv: &mut Cursive) {
     set_status(siv, format!("Saved settings: parallel_jobs={parsed}"));
 }
 
+fn on_parallel_jobs_edit(siv: &mut Cursive, content: &str, _cursor: usize) {
+    let sanitized: String = content.chars().filter(|c| c.is_ascii_digit()).collect();
+    if sanitized == content {
+        return;
+    }
+
+    siv.call_on_name("settings_parallel_jobs", |v: &mut EditView| {
+        v.set_content(sanitized);
+    });
+}
+
 fn spawn_toolchain_scan(siv: &mut Cursive) {
     set_status(siv, "Scanning toolchains...");
     let sink = siv.cb_sink().clone();
@@ -1378,6 +1444,7 @@ fn on_settings(siv: &mut Cursive) {
         .child(
             EditView::new()
                 .content(current_jobs.to_string())
+                .on_edit(on_parallel_jobs_edit)
                 .with_name("settings_parallel_jobs")
                 .fixed_width(12),
         );
