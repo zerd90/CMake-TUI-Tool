@@ -1,30 +1,29 @@
 # CMake TUI Tool
 
-A terminal UI for configuring and building CMake projects. It auto-detects the
-toolchains installed on your system (GCC/MinGW, LLVM Clang, clang-cl, MSVC), lets
-you pick a toolchain / build type / target, and runs CMake configure & build while
-streaming the output into a scrollable window.
+A Cursive-based terminal UI for configuring and building CMake projects. It
+auto-detects toolchains (GCC/MinGW, LLVM Clang, clang-cl, MSVC), lets you pick
+toolchain/build type/target, and runs CMake configure/build while streaming
+output live.
 
 ## Features
 
-- **Toolchain auto-detection** — finds GCC (MinGW), LLVM Clang (GNU CLI &
-  MSVC CLI), and MSVC (all host/target combinations) via `vswhere` and common
-  install paths.
-- **Correct generator selection** — uses the Visual Studio generator for
-  MSVC/clang-cl (`-G "Visual Studio 18 2026" -A <arch> -T <toolset>`) and
-  `MinGW Makefiles` for GCC/Clang, so the selected compiler is actually used.
-- **Configure / Build** — runs `cmake -S ... -B ...` with
-  `-DCMAKE_EXPORT_COMPILE_COMMANDS=TRUE` and the chosen build type, then
-  `cmake --build` (with `--config` for multi-config generators).
-- **Target selection** — lists build targets, including `all` and `install`.
-- **State restore** — reads an existing `build/CMakeCache.txt` to restore the
-  previously used toolchain and build type.
-- **Live output** — streams CMake output into a scrollable window; copy it to the
-  clipboard with one key press.
-- **Settings** — rescan toolchains; selections are cached in `config/toolchain.json`
-  next to the executable.
-- **CLI scanner** — inspect detected toolchains or benchmark them against CMake
-  Tools kits.
+- **Toolchain auto-detection**: Finds GCC (MinGW), LLVM Clang (GNU CLI and MSVC
+  CLI), and MSVC via `vswhere` and common install paths.
+- **Generator/toolset matching**: Uses Visual Studio generator for MSVC/clang-cl
+  and MinGW Makefiles for GCC/Clang to avoid mismatched compiler/generator.
+- **Configure / Build / Stop**: Long-running configure/build operations can be
+  interrupted from the same action button (`Configure -> Stop Configure`,
+  `Build -> Stop Build`).
+- **Delete and Configure**: Removes `build` directory first, then configures.
+- **Clean and Build**: Runs clean target first, then build.
+- **Auto-configure on build**: If `build` folder does not exist, `Build` will
+  auto-run configure before building.
+- **Target handling**: Reads targets from generator output, keeps `all` and
+  `install` prioritized, and preserves selected target when possible.
+- **Workspace-aware persistence**: Stores per-workspace build type and target
+  history with LRU-like pruning.
+- **Live output + copy**: Streams command output in real time and supports copy.
+- **Settings**: Configure parallel jobs and trigger toolchain rescan.
 
 ## Usage
 
@@ -35,6 +34,26 @@ cmake-tui-tool
 ```
 
 Pick a toolchain, build type and target, then press **Configure** and **Build**.
+
+### Interaction
+
+- Use Cursive's standard keyboard navigation to move focus and select options.
+- Trigger actions through the bottom action buttons (`Configure`, `Build`,
+  `Delete and Configure`, `Clean and Build`, `Copy Output`, `Settings`,
+  `Exit`).
+
+### Config files
+
+Config files are stored next to the executable under `config/`:
+
+- `config/toolchain.json`: detected toolchain cache
+- `config/config.json`: app settings and workspace build history
+
+`config/config.json` currently includes:
+
+- `parallel_jobs`
+- `workspace_history_limit`
+- `workspace_builds` (per-workspace `build_type`/`target` and timestamp)
 
 ### CLI
 

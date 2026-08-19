@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub mod runtime;
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Toolchain {
     pub id: String,

@@ -1,15 +1,10 @@
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-
-#[cfg(unix)]
-use std::os::unix::process::CommandExt as UnixCommandExt;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt as WindowsCommandExt;
+use std::sync::Arc;
+use std::time::Instant;
 
 use cursive::traits::{Nameable, Resizable};
 use cursive::views::{
@@ -22,18 +17,12 @@ use cmake_tui_tool::{
     compiler_stem, configure_compiler_args, is_multi_config, load_app_config, load_config,
     parse_cmake_cache, save_app_config, save_config, scan_toolchains, AppConfig, Toolchain,
 };
+use cmake_tui_tool::runtime::{RunResult, run_command_with_cancel};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RunKind {
     Configure,
     Build,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RunResult {
-    Success,
-    Failed,
-    Cancelled,
 }
 
 struct RunningState {
@@ -433,17 +422,6 @@ fn append_output(siv: &mut Cursive, line: impl Into<String>) {
     );
 }
 
-fn refresh_output(siv: &mut Cursive, output: &Arc<Mutex<String>>) {
-    let text = output.lock().unwrap().clone();
-    siv.call_on_name("output", |v: &mut TextView| v.set_content(text));
-    siv.call_on_name(
-        "output_scroll",
-        |v: &mut ScrollView<ResizedView<NamedView<TextView>>>| {
-            v.scroll_to_bottom();
-        },
-    );
-}
-
 fn reset_action_buttons(siv: &mut Cursive) {
     siv.call_on_name("btn_configure", |v: &mut Button| {
         v.set_label("Configure");
@@ -514,196 +492,36 @@ fn running_kind(siv: &mut Cursive) -> Option<RunKind> {
         .and_then(|state| state.running.as_ref().map(|r| r.kind))
 }
 
-fn append_line(output: &Arc<Mutex<String>>, line: &str) {
-    const MAX_LINES: usize = 200;
-    let mut o = output.lock().unwrap();
-    o.push_str(line);
-    o.push('\n');
-    let newlines = o.bytes().filter(|&b| b == b'\n').count();
-    if newlines > MAX_LINES {
-        let skip = newlines - MAX_LINES;
-        let mut pos = 0;
-        let mut seen = 0;
-        for (i, b) in o.bytes().enumerate() {
-            if b == b'\n' {
-                seen += 1;
-                if seen == skip {
-                    pos = i + 1;
-                    break;
-                }
-            }
-        }
-        let tail = o[pos..].to_string();
-        *o = tail;
-    }
-}
-
-fn maybe_refresh(output: &Arc<Mutex<String>>, sink: &CbSink, last: &Arc<Mutex<Instant>>) {
-    let now = Instant::now();
-    let due = {
-        let mut l = last.lock().unwrap();
-        if now.duration_since(*l) >= Duration::from_millis(100) {
-            *l = now;
-            true
-        } else {
-            false
-        }
-    };
-    if due {
-        let output = Arc::clone(output);
-        let sink = sink.clone();
-        let _ = sink.send(Box::new(move |siv| refresh_output(siv, &output)));
-    }
-}
-
-fn read_lines<R: std::io::Read>(
-    reader: R,
-    output: &Arc<Mutex<String>>,
-    sink: &CbSink,
-    last: &Arc<Mutex<Instant>>,
-) {
-    let mut reader = BufReader::new(reader);
-    let mut buf = Vec::new();
-    loop {
-        buf.clear();
-        match reader.read_until(b'\n', &mut buf) {
-            Ok(0) => break,
-            Ok(_) => {
-                let line = String::from_utf8_lossy(&buf);
-                let line = line.trim_end_matches(['\r', '\n']);
-                append_line(output, line);
-                maybe_refresh(output, sink, last);
-            }
-            Err(_) => break,
-        }
-    }
-}
-
 fn run_cmake_command(
     sink: &CbSink,
-    mut cmd: std::process::Command,
+    cmd: std::process::Command,
     header: &str,
     stop: Arc<AtomicBool>,
 ) -> RunResult {
-    let output = Arc::new(Mutex::new(String::new()));
-    let last = Arc::new(Mutex::new(Instant::now()));
-
     if !header.is_empty() {
-        append_line(&output, header);
+        let sink = sink.clone();
+        let header = header.to_string();
+        let _ = sink.send(Box::new(move |siv| {
+            append_output(siv, header);
+        }));
     }
+    let sink_for_line = sink.clone();
+    let on_line = Arc::new(move |line: String| {
+        let sink = sink_for_line.clone();
+        let _ = sink.send(Box::new(move |siv| {
+            append_output(siv, line);
+        }));
+    });
 
-    prepare_cancellable_command(&mut cmd);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
+    match run_command_with_cancel(cmd, stop, on_line) {
+        Ok(result) => result,
         Err(e) => {
-            let msg = format!("Failed to start cmake: {}", e);
+            let msg = format!("Failed to start cmake: {e}");
             let sink = sink.clone();
             let _ = sink.send(Box::new(move |siv| set_status(siv, msg)));
-            return RunResult::Failed;
-        }
-    };
-
-    let mut readers = Vec::new();
-    if let Some(stdout) = child.stdout.take() {
-        let sink = sink.clone();
-        let output = Arc::clone(&output);
-        let last = Arc::clone(&last);
-        readers.push(std::thread::spawn(move || {
-            read_lines(stdout, &output, &sink, &last);
-        }));
-    }
-    if let Some(stderr) = child.stderr.take() {
-        let sink = sink.clone();
-        let output = Arc::clone(&output);
-        let last = Arc::clone(&last);
-        readers.push(std::thread::spawn(move || {
-            read_lines(stderr, &output, &sink, &last);
-        }));
-    }
-
-    let mut cancelled = false;
-    let status = loop {
-        if stop.load(Ordering::SeqCst) {
-            cancelled = true;
-            terminate_child_tree(&mut child);
-            break child.wait();
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(e) => break Err(e),
-        }
-    };
-
-    for reader in readers {
-        let _ = reader.join();
-    }
-    let result = if cancelled {
-        RunResult::Cancelled
-    } else if status.map(|s| s.success()).unwrap_or(false) {
-        RunResult::Success
-    } else {
-        RunResult::Failed
-    };
-
-    let output = Arc::clone(&output);
-    let sink = sink.clone();
-    let _ = sink.send(Box::new(move |siv| refresh_output(siv, &output)));
-
-    result
-}
-
-fn prepare_cancellable_command(cmd: &mut std::process::Command) {
-    #[cfg(unix)]
-    {
-        cmd.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
-    }
-}
-
-fn terminate_child_tree(child: &mut std::process::Child) {
-    let pid = child.id();
-
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-
-    #[cfg(unix)]
-    {
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", &format!("-{pid}")])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(_) => break,
+            RunResult::Failed
         }
     }
-
-    let _ = child.kill();
 }
 
 fn clear_build_cache(build_dir: &Path) {
