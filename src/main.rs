@@ -1228,10 +1228,17 @@ fn start_build_flow(siv: &mut Cursive, clean_first: bool) {
                 clean_cmd.arg("--config").arg(&build_type);
             }
             clean_cmake_env(&mut clean_cmd);
+            let mut clean_cmdline = format!(
+                "$ cmake --build {} --target clean",
+                build_dir.to_string_lossy()
+            );
+            if is_vs {
+                clean_cmdline.push_str(&format!(" --config {}", build_type));
+            }
             let clean_result = run_cmake_command(
                 &sink,
                 clean_cmd,
-                &format!("$ cmake --build {} --target clean", build_dir.to_string_lossy()),
+                &clean_cmdline,
                 Arc::clone(&stop),
             );
             match clean_result {
@@ -1274,11 +1281,31 @@ fn start_build_flow(siv: &mut Cursive, clean_first: bool) {
         }
         cmd.arg("--parallel").arg(parallel_jobs.to_string());
         clean_cmake_env(&mut cmd);
+        cmd.env("CMAKE_BUILD_PARALLEL_LEVEL", parallel_jobs.to_string());
+
+        let mut build_cmdline = format!("$ cmake --build {}", build_dir.to_string_lossy());
+        if !target.is_empty() {
+            let t = if is_vs {
+                match target.as_str() {
+                    "all" => "ALL_BUILD".to_string(),
+                    "install" => "INSTALL".to_string(),
+                    other => other.to_string(),
+                }
+            } else {
+                target.clone()
+            };
+            build_cmdline.push_str(&format!(" --target {}", t));
+        }
+        if is_vs {
+            build_cmdline.push_str(&format!(" --config {}", build_type));
+        }
+        build_cmdline.push_str(&format!(" --parallel {}", parallel_jobs));
+        build_cmdline.push_str(&format!("  # CMAKE_BUILD_PARALLEL_LEVEL={}", parallel_jobs));
 
         let result = run_cmake_command(
             &sink,
             cmd,
-            &format!("$ cmake --build {}", build_dir.to_string_lossy()),
+            &build_cmdline,
             stop,
         );
 
