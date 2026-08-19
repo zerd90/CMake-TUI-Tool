@@ -20,7 +20,13 @@ fn populate_toolchains(siv: &mut Cursive, list: Vec<Toolchain>) {
     siv.call_on_name("toolchain", |v: &mut SelectView<Toolchain>| {
         v.clear();
         for tc in list {
-            let label = format!("{} ({})", tc.name, tc.version);
+            let mut label = format!("{} ({})", tc.name, tc.version);
+            if let Some(tri) = &tc.triple {
+                label.push_str(&format!(" [{}]", tri));
+            } else if let Some(a) = &tc.arch {
+                label.push_str(&format!(" [{}]", a));
+            }
+            label.push_str(&format!("  {}", tc.path));
             v.add_item(label, tc);
         }
     });
@@ -29,12 +35,11 @@ fn populate_toolchains(siv: &mut Cursive, list: Vec<Toolchain>) {
 fn select_by_value(siv: &mut Cursive, name: &str, target: &str) {
     siv.call_on_name(name, |v: &mut SelectView<String>| {
         for i in 0..v.len() {
-            if let Some((_, value)) = v.get_item(i) {
-                if value.as_str() == target {
+            if let Some((_, value)) = v.get_item(i)
+                && value.as_str() == target {
                     v.set_selection(i);
                     break;
                 }
-            }
         }
     });
 }
@@ -42,12 +47,11 @@ fn select_by_value(siv: &mut Cursive, name: &str, target: &str) {
 fn select_toolchain_by_stem(siv: &mut Cursive, stem: &str) {
     siv.call_on_name("toolchain", |v: &mut SelectView<Toolchain>| {
         for i in 0..v.len() {
-            if let Some((_, value)) = v.get_item(i) {
-                if compiler_stem(&value.path).as_deref() == Some(stem) {
+            if let Some((_, value)) = v.get_item(i)
+                && compiler_stem(&value.path).as_deref() == Some(stem) {
                     v.set_selection(i);
                     break;
                 }
-            }
         }
     });
 }
@@ -55,12 +59,11 @@ fn select_toolchain_by_stem(siv: &mut Cursive, stem: &str) {
 fn select_toolchain_by_id_arch(siv: &mut Cursive, id: &str, arch: &str) {
     siv.call_on_name("toolchain", |v: &mut SelectView<Toolchain>| {
         for i in 0..v.len() {
-            if let Some((_, value)) = v.get_item(i) {
-                if value.id == id && (arch.is_empty() || value.arch.as_deref() == Some(arch)) {
+            if let Some((_, value)) = v.get_item(i)
+                && value.id == id && (arch.is_empty() || value.arch.as_deref() == Some(arch)) {
                     v.set_selection(i);
                     break;
                 }
-            }
         }
     });
 }
@@ -72,11 +75,10 @@ fn restore_from_cache(siv: &mut Cursive) {
         return;
     }
 
-    if let Some(bt) = cache.get("CMAKE_BUILD_TYPE") {
-        if !bt.is_empty() {
+    if let Some(bt) = cache.get("CMAKE_BUILD_TYPE")
+        && !bt.is_empty() {
             select_by_value(siv, "build_type", &bt.to_lowercase());
         }
-    }
 
     let generator = cache.get("CMAKE_GENERATOR").cloned().unwrap_or_default();
 
@@ -102,11 +104,10 @@ fn restore_from_cache(siv: &mut Cursive) {
             .get("CMAKE_C_COMPILER")
             .filter(|v| !v.is_empty() && !v.contains("NOTFOUND"))
             .or_else(|| cache.get("CMAKE_CXX_COMPILER"));
-        if let Some(compiler) = compiler {
-            if let Some(stem) = compiler_stem(compiler) {
+        if let Some(compiler) = compiler
+            && let Some(stem) = compiler_stem(compiler) {
                 select_toolchain_by_stem(siv, &stem);
             }
-        }
     }
 }
 
@@ -275,21 +276,12 @@ fn set_status(siv: &mut Cursive, msg: impl Into<String>) {
 }
 
 fn copy_to_clipboard(text: &str) -> bool {
-    let mut child = match std::process::Command::new("clip")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    if let Some(mut stdin) = child.stdin.take() {
-        if stdin.write_all(text.as_bytes()).is_err() {
-            return false;
-        }
-    }
-    child.wait().map(|s| s.success()).unwrap_or(false)
+    use base64::Engine;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let osc = format!("\x1b]52;c;{}\x1b\\", encoded);
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(osc.as_bytes()).is_ok() && stdout.flush().is_ok()
 }
 
 fn on_copy_output(siv: &mut Cursive) {
@@ -571,24 +563,22 @@ fn stale_cache_conflict(build_dir: &Path, toolchain: &Toolchain) -> Option<Strin
             generator
         ));
     }
-    if let Some(arch) = &toolchain.arch {
-        if cache.get("CMAKE_GENERATOR_PLATFORM").is_some_and(|p| p != arch) {
+    if let Some(arch) = &toolchain.arch
+        && cache.get("CMAKE_GENERATOR_PLATFORM").is_some_and(|p| p != arch) {
             return Some(format!(
                 "platform: {} -> {}",
                 cache.get("CMAKE_GENERATOR_PLATFORM").unwrap(),
                 arch
             ));
         }
-    }
-    if let Some(toolset) = &toolchain.toolset {
-        if cache.get("CMAKE_GENERATOR_TOOLSET").is_some_and(|t| t != toolset) {
+    if let Some(toolset) = &toolchain.toolset
+        && cache.get("CMAKE_GENERATOR_TOOLSET").is_some_and(|t| t != toolset) {
             return Some(format!(
                 "toolset: {} -> {}",
                 cache.get("CMAKE_GENERATOR_TOOLSET").unwrap(),
                 toolset
             ));
         }
-    }
     None
 }
 
@@ -626,11 +616,12 @@ fn on_configure(siv: &mut Cursive) {
     std::thread::spawn(move || {
         let build_dir = project_dir.join("build");
 
-        let mut args: Vec<String> = Vec::new();
-        args.push("-S".to_string());
-        args.push(project_dir.to_string_lossy().to_string());
-        args.push("-B".to_string());
-        args.push(build_dir.to_string_lossy().to_string());
+        let mut args: Vec<String> = vec![
+            "-S".to_string(),
+            project_dir.to_string_lossy().to_string(),
+            "-B".to_string(),
+            build_dir.to_string_lossy().to_string(),
+        ];
         if !is_multi_config(&toolchain) {
             args.push(format!("-DCMAKE_BUILD_TYPE={}", build_type));
         }
@@ -789,8 +780,8 @@ fn main() {
         .child(Panel::new(target).title("Target").full_width());
 
     let actions = LinearLayout::horizontal()
-        .child(Button::new("Configure", |s| on_configure(s)))
-        .child(Button::new("Build", |s| on_build(s)));
+        .child(Button::new("Configure", on_configure))
+        .child(Button::new("Build", on_build));
 
     let output = TextView::new("").with_name("output").full_width();
     let output_scroll = ScrollView::new(output)
@@ -804,8 +795,8 @@ fn main() {
 
     let statusbar = LinearLayout::horizontal()
         .child(status)
-        .child(Button::new("Copy Output", |s| on_copy_output(s)))
-        .child(Button::new("Settings", |s| on_settings(s)));
+        .child(Button::new("Copy Output", on_copy_output))
+        .child(Button::new("Settings", on_settings));
 
     let root = LinearLayout::vertical()
         .child(row1)
@@ -817,8 +808,7 @@ fn main() {
     siv.add_layer(root);
 
     let cached = load_config();
-    let stale = cached.iter().any(|t| t.generator.is_none());
-    if cached.is_empty() || stale {
+    if cached.is_empty() {
         spawn_toolchain_scan(&mut siv);
     } else {
         let n = cached.len();

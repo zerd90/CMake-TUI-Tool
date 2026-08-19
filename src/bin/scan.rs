@@ -43,6 +43,9 @@ fn scan(args: &[String]) {
             if let Some(a) = &t.arch {
                 extra.push_str(&format!("  arch={a}"));
             }
+            if let Some(tri) = &t.triple {
+                extra.push_str(&format!("  triple={tri}"));
+            }
             if let Some(tool) = &t.toolset {
                 extra.push_str(&format!("  toolset={tool}"));
             }
@@ -57,11 +60,10 @@ fn scan(args: &[String]) {
 
 fn kits_path_from_args(args: &[String]) -> String {
     for (i, a) in args.iter().enumerate() {
-        if a == "--kits" {
-            if let Some(p) = args.get(i + 1) {
+        if a == "--kits"
+            && let Some(p) = args.get(i + 1) {
                 return p.clone();
             }
-        }
     }
     DEFAULT_KITS.to_string()
 }

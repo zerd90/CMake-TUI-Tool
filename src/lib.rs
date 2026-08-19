@@ -16,6 +16,8 @@ pub struct Toolchain {
     #[serde(default)]
     pub arch: Option<String>,
     #[serde(default)]
+    pub triple: Option<String>,
+    #[serde(default)]
     pub toolset: Option<String>,
 }
 
@@ -94,19 +96,109 @@ fn sibling_exe(exe: &Path, name: &str) -> Option<String> {
     p.exists().then(|| p.to_string_lossy().to_string())
 }
 
-fn find_on_path(name: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let bare = dir.join(name);
-        if bare.is_file() {
-            return Some(bare);
-        }
-        let with_exe = dir.join(format!("{name}.exe"));
-        if with_exe.is_file() {
-            return Some(with_exe);
+#[derive(Clone, Copy, PartialEq)]
+enum Vendor {
+    Gcc,
+    Clang,
+    ClangCl,
+}
+
+fn compiler_kind(fname: &str) -> Option<Vendor> {
+    let stem = fname.trim_end_matches(".exe").to_lowercase();
+    if stem == "clang-cl" || stem.starts_with("clang-cl-") {
+        return Some(Vendor::ClangCl);
+    }
+    if stem == "clang" || stem.starts_with("clang-") {
+        return Some(Vendor::Clang);
+    }
+    if stem == "gcc"
+        || stem.starts_with("gcc-")
+        || stem.ends_with("-gcc")
+        || stem.contains("-gcc-")
+    {
+        return Some(Vendor::Gcc);
+    }
+    None
+}
+
+fn first_version_token(s: &str) -> Option<String> {
+    let t = s.split_whitespace().next()?.trim_end_matches('.');
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+fn clang_version(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim_start();
+        let rest = if let Some(i) = line.find("clang version ") {
+            &line[i + "clang version ".len()..]
+        } else if let Some(i) = line.find("Apple LLVM version ") {
+            &line[i + "Apple LLVM version ".len()..]
+        } else {
+            continue;
+        };
+        if let Some(v) = first_version_token(rest) {
+            return Some(v);
         }
     }
     None
+}
+
+fn gcc_version(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim_start();
+        let rest = if let Some(r) = line.strip_prefix("gcc version ") {
+            r
+        } else if let Some(r) = line.strip_prefix("gcc-version ") {
+            r
+        } else {
+            continue;
+        };
+        if let Some(v) = first_version_token(rest) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn target_triple(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Target: ") {
+            let t = rest.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn detect_compiler(exe: &Path, vendor: Vendor) -> Option<(String, Option<String>)> {
+    let out = std::process::Command::new(exe).arg("-v").output().ok()?;
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let version = match vendor {
+        Vendor::Clang | Vendor::ClangCl => clang_version(&text)?,
+        Vendor::Gcc => gcc_version(&text)?,
+    };
+    Some((version, target_triple(&text)))
+}
+
+fn sibling_compiler(exe: &Path, from: &str, to: &str) -> Option<String> {
+    let fname = exe.file_name()?.to_string_lossy().to_string();
+    let new_fname = fname.replacen(from, to, 1);
+    if new_fname == fname {
+        return None;
+    }
+    let p = exe.parent()?.join(new_fname);
+    p.exists().then(|| p.to_string_lossy().to_string())
 }
 
 fn arch_label(a: &str) -> &str {
@@ -167,13 +259,11 @@ fn year_for_major(major: u64) -> u64 {
 fn extract_year(s: &str) -> Option<u64> {
     let bytes = s.as_bytes();
     for i in 0..bytes.len().saturating_sub(3) {
-        if bytes[i..i + 4].iter().all(|b| b.is_ascii_digit()) {
-            if let Ok(y) = s[i..i + 4].parse::<u64>() {
-                if (2000..=2100).contains(&y) {
+        if bytes[i..i + 4].iter().all(|b| b.is_ascii_digit())
+            && let Ok(y) = s[i..i + 4].parse::<u64>()
+                && (2000..=2100).contains(&y) {
                     return Some(y);
                 }
-            }
-        }
     }
     None
 }
@@ -253,9 +343,9 @@ fn vs_instances() -> Vec<VsInstance> {
                 "json",
             ])
             .output();
-        if let Ok(o) = out {
-            if o.status.success() {
-                if let Ok(entries) = serde_json::from_slice::<Vec<VsWhereEntry>>(&o.stdout) {
+        if let Ok(o) = out
+            && o.status.success()
+                && let Ok(entries) = serde_json::from_slice::<Vec<VsWhereEntry>>(&o.stdout) {
                     let instances: Vec<VsInstance> = entries
                         .into_iter()
                         .filter(|e| !e.path.is_empty())
@@ -274,8 +364,6 @@ fn vs_instances() -> Vec<VsInstance> {
                         return instances;
                     }
                 }
-            }
-        }
     }
     discover_vs_roots()
 }
@@ -302,6 +390,7 @@ pub fn probe_mingw() -> Vec<Toolchain> {
                 cxx: sibling_exe(&gcc, "g++.exe"),
                 generator: Some("MinGW Makefiles".to_string()),
                 arch: None,
+                triple: None,
                 toolset: None,
                 path: gcc.to_string_lossy().to_string(),
             });
@@ -338,8 +427,8 @@ pub fn probe_llvm() -> Vec<Toolchain> {
         let clang = bin.join("clang.exe");
         let clang_cl = bin.join("clang-cl.exe");
 
-        if clang.exists() {
-            if let Some(version) = version_of(&clang) {
+        if clang.exists()
+            && let Some(version) = version_of(&clang) {
                 found.push(Toolchain {
                     id: "clang".to_string(),
                     name: "Clang".to_string(),
@@ -347,13 +436,13 @@ pub fn probe_llvm() -> Vec<Toolchain> {
                     cxx: sibling_exe(&clang, "clang++.exe"),
                     generator: Some("MinGW Makefiles".to_string()),
                     arch: None,
+                    triple: None,
                     toolset: None,
                     path: clang.to_string_lossy().to_string(),
                 });
             }
-        }
-        if clang_cl.exists() {
-            if let Some(version) = version_of(&clang_cl) {
+        if clang_cl.exists()
+            && let Some(version) = version_of(&clang_cl) {
                 found.push(Toolchain {
                     id: "clang-cl".to_string(),
                     name: "Clang (MSVC CLI)".to_string(),
@@ -361,11 +450,11 @@ pub fn probe_llvm() -> Vec<Toolchain> {
                     cxx: Some(clang_cl.to_string_lossy().to_string()),
                     generator: vs.generator.clone(),
                     arch: Some("x64".to_string()),
+                    triple: None,
                     toolset: Some("ClangCL".to_string()),
                     path: clang_cl.to_string_lossy().to_string(),
                 });
             }
-        }
     }
     found
 }
@@ -444,6 +533,7 @@ pub fn probe_msvc() -> Vec<Toolchain> {
                     cxx: None,
                     generator: vs.generator.clone(),
                     arch: Some(cmake_arch(&target_name).to_string()),
+                    triple: None,
                     toolset: host_toolset(&host_name),
                     path: cl.to_string_lossy().to_string(),
                 });
@@ -455,47 +545,68 @@ pub fn probe_msvc() -> Vec<Toolchain> {
 
 fn probe_path() -> Vec<Toolchain> {
     let mut found = Vec::new();
-    for (cand, id, name) in [
-        ("gcc", "gcc", "GCC"),
-        ("clang", "clang", "Clang"),
-        ("clang-cl", "clang-cl", "Clang (MSVC CLI)"),
-    ] {
-        let Some(path) = find_on_path(cand) else {
-            continue;
-        };
-        let lower = path.to_string_lossy().to_lowercase();
-        if lower.contains(".vscode") || lower.contains("extensions") {
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return found;
+    };
+    for dir in std::env::split_paths(&path_var) {
+        let dir_str = dir.to_string_lossy().to_lowercase();
+        if dir_str.contains(".vscode") || dir_str.contains("extensions") {
             continue;
         }
-        if let Some(version) = version_of(&path) {
-            let cxx = if cand == "clang-cl" {
-                Some(path.to_string_lossy().to_string())
-            } else {
-                sibling_exe(&path, if cand == "gcc" { "g++.exe" } else { "clang++.exe" })
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(fname) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+                continue;
             };
-            let generator = if cand == "clang-cl" {
-                Some("Visual Studio 18 2026".to_string())
-            } else {
+            let Some(vendor) = compiler_kind(&fname) else {
+                continue;
+            };
+            let Some((version, triple)) = detect_compiler(&path, vendor) else {
+                continue;
+            };
+
+            let (id, name) = match vendor {
+                Vendor::Gcc => ("gcc", "GCC"),
+                Vendor::Clang => ("clang", "Clang"),
+                Vendor::ClangCl => ("clang-cl", "Clang-cl"),
+            };
+
+            let cxx = match vendor {
+                Vendor::ClangCl => Some(path.to_string_lossy().to_string()),
+                Vendor::Gcc => sibling_compiler(&path, "gcc", "g++"),
+                Vendor::Clang => sibling_compiler(&path, "clang", "clang++"),
+            };
+
+            let mingw = matches!(vendor, Vendor::Gcc | Vendor::Clang)
+                && cfg!(windows)
+                && {
+                    let lp = path.to_string_lossy().to_lowercase();
+                    (lp.contains("mingw") || lp.contains("msys"))
+                        && path
+                            .parent()
+                            .is_some_and(|d| d.join("mingw32-make.exe").exists())
+                };
+            let generator = if mingw {
                 Some("MinGW Makefiles".to_string())
-            };
-            let toolset = if cand == "clang-cl" {
-                Some("ClangCL".to_string())
             } else {
                 None
             };
-            let arch = if cand == "clang-cl" {
-                Some("x64".to_string())
-            } else {
-                None
-            };
+
             found.push(Toolchain {
                 id: id.to_string(),
                 name: name.to_string(),
                 version,
                 cxx,
                 generator,
-                arch,
-                toolset,
+                arch: None,
+                triple,
+                toolset: None,
                 path: path.to_string_lossy().to_string(),
             });
         }
@@ -509,14 +620,18 @@ fn dedup_toolchains(list: &mut Vec<Toolchain>) {
 }
 
 pub fn scan_toolchains(mut progress: impl FnMut(String)) -> Vec<Toolchain> {
-    progress("Scanning toolchains: MinGW GCC...".to_string());
-    let mut found = probe_mingw();
+    let mut found = Vec::new();
 
-    progress("Scanning toolchains: LLVM/Clang...".to_string());
-    found.extend(probe_llvm());
+    if cfg!(windows) {
+        progress("Scanning toolchains: MinGW GCC...".to_string());
+        found.extend(probe_mingw());
 
-    progress("Scanning toolchains: MSVC...".to_string());
-    found.extend(probe_msvc());
+        progress("Scanning toolchains: LLVM/Clang...".to_string());
+        found.extend(probe_llvm());
+
+        progress("Scanning toolchains: MSVC...".to_string());
+        found.extend(probe_msvc());
+    }
 
     progress("Scanning toolchains: PATH fallback...".to_string());
     found.extend(probe_path());
@@ -557,7 +672,9 @@ pub fn parse_cmake_cache(path: &Path) -> HashMap<String, String> {
 }
 
 pub fn is_multi_config(tc: &Toolchain) -> bool {
-    matches!(tc.id.as_str(), "msvc" | "clang-cl")
+    tc.generator
+        .as_deref()
+        .is_some_and(|g| g.starts_with("Visual Studio"))
 }
 
 fn push_generator(args: &mut Vec<String>, tc: &Toolchain) {
@@ -569,49 +686,34 @@ fn push_generator(args: &mut Vec<String>, tc: &Toolchain) {
 
 pub fn configure_compiler_args(tc: &Toolchain) -> Vec<String> {
     let mut args = Vec::new();
-    match tc.id.as_str() {
-        "msvc" | "clang-cl" => {
-            push_generator(&mut args, tc);
-            if let Some(a) = &tc.arch {
-                args.push("-A".to_string());
-                args.push(a.clone());
-            }
-            if let Some(t) = &tc.toolset {
-                args.push("-T".to_string());
-                args.push(t.clone());
-            }
+    let vs = tc
+        .generator
+        .as_deref()
+        .is_some_and(|g| g.starts_with("Visual Studio"));
+
+    if vs {
+        push_generator(&mut args, tc);
+        if let Some(a) = &tc.arch {
+            args.push("-A".to_string());
+            args.push(a.clone());
         }
-        "gcc" => {
-            push_generator(&mut args, tc);
-            args.push(format!("-DCMAKE_C_COMPILER={}", tc.path));
-            args.push(format!(
-                "-DCMAKE_CXX_COMPILER={}",
-                tc.cxx.clone().unwrap_or_else(|| "g++".to_string())
-            ));
+        if let Some(t) = &tc.toolset {
+            args.push("-T".to_string());
+            args.push(t.clone());
         }
-        "clang" => {
-            push_generator(&mut args, tc);
-            args.push(format!("-DCMAKE_C_COMPILER={}", tc.path));
-            args.push(format!(
-                "-DCMAKE_CXX_COMPILER={}",
-                tc.cxx.clone().unwrap_or_else(|| "clang++".to_string())
-            ));
-        }
-        _ => {
-            if let Some(stem) = compiler_stem(&tc.path) {
-                match stem.as_str() {
-                    "g++" | "c++" | "clang++" => {
-                        args.push(format!("-DCMAKE_CXX_COMPILER={}", tc.path))
-                    }
-                    "cl" => {
-                        args.push(format!("-DCMAKE_C_COMPILER={}", tc.path));
-                        args.push(format!("-DCMAKE_CXX_COMPILER={}", tc.path));
-                    }
-                    _ => {}
-                }
-            }
-        }
+        return args;
     }
+
+    push_generator(&mut args, tc);
+    args.push(format!("-DCMAKE_C_COMPILER={}", tc.path));
+    let cxx = tc
+        .cxx
+        .clone()
+        .unwrap_or_else(|| match compiler_stem(&tc.path).as_deref() {
+            Some("gcc") => "g++".to_string(),
+            _ => "clang++".to_string(),
+        });
+    args.push(format!("-DCMAKE_CXX_COMPILER={}", cxx));
     args
 }
 
@@ -647,6 +749,7 @@ mod tests {
             cxx: Some("D:/mingw64/bin/g++.exe".to_string()),
             generator: Some("MinGW Makefiles".to_string()),
             arch: None,
+            triple: None,
             toolset: None,
         };
         assert_eq!(
@@ -668,6 +771,7 @@ mod tests {
             cxx: None,
             generator: Some("Visual Studio 18 2026".to_string()),
             arch: Some("x64".to_string()),
+            triple: None,
             toolset: None,
         };
         assert_eq!(
@@ -688,6 +792,7 @@ mod tests {
             cxx: Some("E:/foo/clang-cl.exe".to_string()),
             generator: Some("Visual Studio 18 2026".to_string()),
             arch: Some("x64".to_string()),
+            triple: None,
             toolset: Some("ClangCL".to_string()),
         };
         assert_eq!(
