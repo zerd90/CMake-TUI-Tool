@@ -35,7 +35,7 @@ use windows_sys::Win32::System::Console::{
 #[cfg(unix)]
 use std::fs::OpenOptions;
 #[cfg(unix)]
-use std::io::{Read, Write};
+use std::io::Read;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 
