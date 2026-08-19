@@ -2,19 +2,49 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as UnixCommandExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as WindowsCommandExt;
+
 use cursive::traits::{Nameable, Resizable};
 use cursive::views::{
-    Button, Dialog, LinearLayout, NamedView, Panel, ResizedView, ScrollView, SelectView, TextView,
+    Button, Dialog, EditView, LinearLayout, NamedView, Panel, ResizedView, ScrollView, SelectView,
+    TextView,
 };
 use cursive::{CbSink, Cursive};
 
 use cmake_tui_tool::{
-    compiler_stem, configure_compiler_args, is_multi_config, load_config, parse_cmake_cache,
-    save_config, scan_toolchains, Toolchain,
+    compiler_stem, configure_compiler_args, is_multi_config, load_app_config, load_config,
+    parse_cmake_cache, save_app_config, save_config, scan_toolchains, AppConfig, Toolchain,
 };
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunKind {
+    Configure,
+    Build,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunResult {
+    Success,
+    Failed,
+    Cancelled,
+}
+
+struct RunningState {
+    kind: RunKind,
+    stop: Arc<AtomicBool>,
+}
+
+struct UiState {
+    app_config: AppConfig,
+    running: Option<RunningState>,
+}
 
 fn populate_toolchains(siv: &mut Cursive, list: Vec<Toolchain>) {
     siv.call_on_name("toolchain", |v: &mut SelectView<Toolchain>| {
@@ -245,12 +275,96 @@ fn scan_targets_from_build(build_dir: &Path) -> Vec<String> {
 }
 
 fn populate_targets(siv: &mut Cursive, targets: Vec<String>) {
+    let targets = prioritize_targets(targets);
     siv.call_on_name("target", |v: &mut SelectView<String>| {
         v.clear();
         for t in targets {
             v.add_item(t.clone(), t);
         }
     });
+}
+
+fn prioritize_targets(targets: Vec<String>) -> Vec<String> {
+    let mut all = None;
+    let mut install = None;
+    let mut rest = Vec::new();
+    for t in targets {
+        if t == "all" && all.is_none() {
+            all = Some(t);
+        } else if t == "install" && install.is_none() {
+            install = Some(t);
+        } else {
+            rest.push(t);
+        }
+    }
+
+    let mut ordered = Vec::new();
+    if let Some(t) = all {
+        ordered.push(t);
+    }
+    if let Some(t) = install {
+        ordered.push(t);
+    }
+    ordered.extend(rest);
+    ordered
+}
+
+fn current_target_selection_state(siv: &mut Cursive) -> (bool, String) {
+    let mut has_items = false;
+    let mut selected = String::new();
+    siv.call_on_name("target", |v: &mut SelectView<String>| {
+        has_items = v.len() > 0;
+        if let Some(sel) = v.selection() {
+            selected = sel.to_string();
+        }
+    });
+    (has_items, selected)
+}
+
+fn current_workspace_dir() -> std::path::PathBuf {
+    std::env::current_dir().unwrap_or_default()
+}
+
+fn restore_build_type_from_workspace_history(siv: &mut Cursive) {
+    let workspace = current_workspace_dir();
+    let saved_build_type = siv
+        .user_data::<UiState>()
+        .and_then(|state| state.app_config.workspace_build(&workspace))
+        .map(|entry| entry.build_type.clone())
+        .unwrap_or_default();
+    if !saved_build_type.is_empty() {
+        select_by_value(siv, "build_type", &saved_build_type);
+    }
+}
+
+fn restore_target_from_workspace_history(siv: &mut Cursive) {
+    let workspace = current_workspace_dir();
+    let saved_target = siv
+        .user_data::<UiState>()
+        .and_then(|state| state.app_config.workspace_build(&workspace))
+        .map(|entry| entry.target.clone())
+        .unwrap_or_default();
+    if !saved_target.is_empty() {
+        select_by_value(siv, "target", &saved_target);
+    }
+}
+
+fn remember_workspace_build_selection(siv: &mut Cursive, build_type: &str, target: &str) {
+    let workspace = current_workspace_dir();
+    if let Some(state) = siv.user_data::<UiState>() {
+        state
+            .app_config
+            .remember_workspace_build(&workspace, build_type, target);
+        save_app_config(&state.app_config);
+    }
+}
+
+fn populate_targets_preserve(siv: &mut Cursive, targets: Vec<String>, selected: Option<String>) {
+    let keep = selected.unwrap_or_default();
+    populate_targets(siv, targets);
+    if !keep.is_empty() {
+        select_by_value(siv, "target", &keep);
+    }
 }
 
 fn selection(siv: &mut Cursive, name: &str) -> String {
@@ -330,6 +444,76 @@ fn refresh_output(siv: &mut Cursive, output: &Arc<Mutex<String>>) {
     );
 }
 
+fn reset_action_buttons(siv: &mut Cursive) {
+    siv.call_on_name("btn_configure", |v: &mut Button| {
+        v.set_label("Configure");
+        v.set_enabled(true);
+    });
+    siv.call_on_name("btn_build", |v: &mut Button| {
+        v.set_label("Build");
+        v.set_enabled(true);
+    });
+}
+
+fn set_running_buttons(siv: &mut Cursive, kind: RunKind) {
+    match kind {
+        RunKind::Configure => {
+            siv.call_on_name("btn_configure", |v: &mut Button| {
+                v.set_label("Stop Configure");
+                v.set_enabled(true);
+            });
+            siv.call_on_name("btn_build", |v: &mut Button| v.set_enabled(false));
+            siv.call_on_name("btn_delete_configure", |v: &mut Button| v.set_enabled(false));
+            siv.call_on_name("btn_clean_build", |v: &mut Button| v.set_enabled(false));
+        }
+        RunKind::Build => {
+            siv.call_on_name("btn_build", |v: &mut Button| {
+                v.set_label("Stop Build");
+                v.set_enabled(true);
+            });
+            siv.call_on_name("btn_configure", |v: &mut Button| v.set_enabled(false));
+            siv.call_on_name("btn_delete_configure", |v: &mut Button| v.set_enabled(false));
+            siv.call_on_name("btn_clean_build", |v: &mut Button| v.set_enabled(false));
+        }
+    }
+}
+
+fn start_running(siv: &mut Cursive, kind: RunKind) -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
+    if let Some(state) = siv.user_data::<UiState>() {
+        state.running = Some(RunningState {
+            kind,
+            stop: Arc::clone(&stop),
+        });
+    }
+    set_running_buttons(siv, kind);
+    stop
+}
+
+fn finish_running(siv: &mut Cursive) {
+    if let Some(state) = siv.user_data::<UiState>() {
+        state.running = None;
+    }
+    reset_action_buttons(siv);
+    siv.call_on_name("btn_delete_configure", |v: &mut Button| v.set_enabled(true));
+    siv.call_on_name("btn_clean_build", |v: &mut Button| v.set_enabled(true));
+}
+
+fn request_stop(siv: &mut Cursive, kind: RunKind) -> bool {
+    if let Some(state) = siv.user_data::<UiState>()
+        && let Some(running) = &state.running
+            && running.kind == kind {
+                running.stop.store(true, Ordering::SeqCst);
+                return true;
+            }
+    false
+}
+
+fn running_kind(siv: &mut Cursive) -> Option<RunKind> {
+    siv.user_data::<UiState>()
+        .and_then(|state| state.running.as_ref().map(|r| r.kind))
+}
+
 fn append_line(output: &Arc<Mutex<String>>, line: &str) {
     const MAX_LINES: usize = 200;
     let mut o = output.lock().unwrap();
@@ -395,7 +579,12 @@ fn read_lines<R: std::io::Read>(
     }
 }
 
-fn run_cmake_command(sink: &CbSink, mut cmd: std::process::Command, header: &str) -> bool {
+fn run_cmake_command(
+    sink: &CbSink,
+    mut cmd: std::process::Command,
+    header: &str,
+    stop: Arc<AtomicBool>,
+) -> RunResult {
     let output = Arc::new(Mutex::new(String::new()));
     let last = Arc::new(Mutex::new(Instant::now()));
 
@@ -403,6 +592,7 @@ fn run_cmake_command(sink: &CbSink, mut cmd: std::process::Command, header: &str
         append_line(&output, header);
     }
 
+    prepare_cancellable_command(&mut cmd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -410,7 +600,7 @@ fn run_cmake_command(sink: &CbSink, mut cmd: std::process::Command, header: &str
             let msg = format!("Failed to start cmake: {}", e);
             let sink = sink.clone();
             let _ = sink.send(Box::new(move |siv| set_status(siv, msg)));
-            return false;
+            return RunResult::Failed;
         }
     };
 
@@ -432,17 +622,88 @@ fn run_cmake_command(sink: &CbSink, mut cmd: std::process::Command, header: &str
         }));
     }
 
-    let status = child.wait();
+    let mut cancelled = false;
+    let status = loop {
+        if stop.load(Ordering::SeqCst) {
+            cancelled = true;
+            terminate_child_tree(&mut child);
+            break child.wait();
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => break Err(e),
+        }
+    };
+
     for reader in readers {
         let _ = reader.join();
     }
-    let ok = status.map(|s| s.success()).unwrap_or(false);
+    let result = if cancelled {
+        RunResult::Cancelled
+    } else if status.map(|s| s.success()).unwrap_or(false) {
+        RunResult::Success
+    } else {
+        RunResult::Failed
+    };
 
     let output = Arc::clone(&output);
     let sink = sink.clone();
     let _ = sink.send(Box::new(move |siv| refresh_output(siv, &output)));
 
-    ok
+    result
+}
+
+fn prepare_cancellable_command(cmd: &mut std::process::Command) {
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+}
+
+fn terminate_child_tree(child: &mut std::process::Child) {
+    let pid = child.id();
+
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &format!("-{pid}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => break,
+        }
+    }
+
+    let _ = child.kill();
 }
 
 fn clear_build_cache(build_dir: &Path) {
@@ -597,24 +858,46 @@ fn format_command(args: &[String]) -> String {
     s
 }
 
-fn on_configure(siv: &mut Cursive) {
+fn start_configure_flow(siv: &mut Cursive, delete_build_dir_first: bool) {
     let project_dir = std::env::current_dir().unwrap_or_default();
     let build_type = selection(siv, "build_type");
+    let (had_targets_before, selected_target_before) = current_target_selection_state(siv);
     let Some(toolchain) = selected_toolchain(siv) else {
         set_status(siv, "No toolchain selected");
         return;
     };
     let toolchain_label = format!("{} ({})", toolchain.name, toolchain.version);
     let sink = siv.cb_sink().clone();
+    let stop = start_running(siv, RunKind::Configure);
 
     clear_output(siv);
-    set_status(
-        siv,
-        format!("Configuring: toolchain={} build_type={}", toolchain_label, build_type),
-    );
+    if delete_build_dir_first {
+        set_status(
+            siv,
+            format!(
+                "Delete and configure: toolchain={} build_type={}",
+                toolchain_label, build_type
+            ),
+        );
+    } else {
+        set_status(
+            siv,
+            format!("Configuring: toolchain={} build_type={}", toolchain_label, build_type),
+        );
+    }
 
     std::thread::spawn(move || {
+        let started = Instant::now();
         let build_dir = project_dir.join("build");
+        let mut pre_notes: Vec<String> = Vec::new();
+
+        if delete_build_dir_first {
+            pre_notes.push("Delete and configure: removing build directory".to_string());
+            if let Err(e) = std::fs::remove_dir_all(&build_dir)
+                && e.kind() != std::io::ErrorKind::NotFound {
+                    pre_notes.push(format!("Failed to remove build directory: {e}"));
+                }
+        }
 
         let mut args: Vec<String> = vec![
             "-S".to_string(),
@@ -630,43 +913,86 @@ fn on_configure(siv: &mut Cursive) {
 
         if let Some(conflict) = stale_cache_conflict(&build_dir, &toolchain) {
             let msg = format!("Toolchain changed ({conflict}), clearing build cache");
-            let sink = sink.clone();
-            let _ = sink.send(Box::new(move |siv| append_output(siv, msg)));
+            pre_notes.push(msg);
             clear_build_cache(&build_dir);
         } else if broken_cache(&build_dir) {
             let msg = "Broken build cache detected (compiler/linker NOTFOUND), clearing it";
-            let sink = sink.clone();
-            let _ = sink.send(Box::new(move |siv| append_output(siv, msg)));
+            pre_notes.push(msg.to_string());
             clear_build_cache(&build_dir);
         }
 
         let cmdline = format_command(&args);
-        let header = format!("{}\n$ {cmdline}", env_diagnostics());
+        let mut header = format!("{}\n$ {cmdline}", env_diagnostics());
+        for note in pre_notes {
+            header.push('\n');
+            header.push_str(&note);
+        }
 
         let mut cmd = std::process::Command::new("cmake");
         cmd.args(&args);
         clean_cmake_env(&mut cmd);
 
-        let ok = run_cmake_command(&sink, cmd, &header);
+        let result = run_cmake_command(&sink, cmd, &header, stop);
 
-        if ok {
-            let targets = scan_targets_from_build(&build_dir);
-            let n = targets.len();
-            let _ = sink.send(Box::new(move |siv| {
-                populate_targets(siv, targets);
-                set_status(siv, format!("Configure succeeded: {} target(s)", n));
-            }));
-        } else {
-            let _ = sink.send(Box::new(move |siv| set_status(siv, "Configure failed")));
+        match result {
+            RunResult::Success => {
+                let targets = scan_targets_from_build(&build_dir);
+                let n = targets.len();
+                let elapsed = started.elapsed();
+                let prev = if had_targets_before {
+                    Some(selected_target_before)
+                } else {
+                    None
+                };
+                let _ = sink.send(Box::new(move |siv| {
+                    populate_targets_preserve(siv, targets, prev);
+                    let secs = elapsed.as_secs_f32();
+                    append_output(siv, format!("Configure finished in {:.2}s", secs));
+                    set_status(siv, format!("Configure succeeded: {} target(s) in {:.2}s", n, secs));
+                    finish_running(siv);
+                }));
+            }
+            RunResult::Cancelled => {
+                let elapsed = started.elapsed();
+                let _ = sink.send(Box::new(move |siv| {
+                    let secs = elapsed.as_secs_f32();
+                    append_output(siv, format!("Configure stopped after {:.2}s", secs));
+                    set_status(siv, format!("Configure stopped after {:.2}s", secs));
+                    finish_running(siv);
+                }));
+            }
+            RunResult::Failed => {
+                let elapsed = started.elapsed();
+                let _ = sink.send(Box::new(move |siv| {
+                    let secs = elapsed.as_secs_f32();
+                    append_output(siv, format!("Configure failed after {:.2}s", secs));
+                    set_status(siv, format!("Configure failed after {:.2}s", secs));
+                    finish_running(siv);
+                }));
+            }
         }
     });
 }
 
-fn on_build(siv: &mut Cursive) {
+fn start_build_flow(siv: &mut Cursive, clean_first: bool) {
     let project_dir = std::env::current_dir().unwrap_or_default();
+    let build_dir = project_dir.join("build");
+    let needs_configure = !build_dir.exists();
     let target = selection(siv, "target");
     let build_type = selection(siv, "build_type");
+    let toolchain = if needs_configure {
+        let Some(tc) = selected_toolchain(siv) else {
+            set_status(siv, "No build folder and no toolchain selected");
+            return;
+        };
+        Some(tc)
+    } else {
+        None
+    };
+    let parallel_jobs = current_parallel_jobs(siv);
+    remember_workspace_build_selection(siv, &build_type, &target);
     let sink = siv.cb_sink().clone();
+    let stop = start_running(siv, RunKind::Build);
 
     let label = if target.is_empty() {
         "all".to_string()
@@ -674,14 +1000,104 @@ fn on_build(siv: &mut Cursive) {
         target.clone()
     };
     clear_output(siv);
-    set_status(siv, format!("Building '{}'...", label));
+    if clean_first {
+        set_status(siv, format!("Cleaning and building '{}'...", label));
+    } else {
+        set_status(siv, format!("Building '{}'...", label));
+    }
 
     std::thread::spawn(move || {
-        let build_dir = project_dir.join("build");
+        let started = Instant::now();
+        if needs_configure {
+            let toolchain = toolchain.expect("toolchain is required when auto-configuring");
+            let mut args: Vec<String> = vec![
+                "-S".to_string(),
+                project_dir.to_string_lossy().to_string(),
+                "-B".to_string(),
+                build_dir.to_string_lossy().to_string(),
+            ];
+            if !is_multi_config(&toolchain) {
+                args.push(format!("-DCMAKE_BUILD_TYPE={}", build_type));
+            }
+            args.push("-DCMAKE_EXPORT_COMPILE_COMMANDS:BOOL=TRUE".to_string());
+            args.extend(configure_compiler_args(&toolchain));
+
+            let cmdline = format_command(&args);
+            let header = format!(
+                "{}\nNo build folder found, auto-running configure before build\n$ {cmdline}",
+                env_diagnostics()
+            );
+
+            let mut configure_cmd = std::process::Command::new("cmake");
+            configure_cmd.args(&args);
+            clean_cmake_env(&mut configure_cmd);
+
+            let configure_result = run_cmake_command(&sink, configure_cmd, &header, Arc::clone(&stop));
+            match configure_result {
+                RunResult::Success => {
+                    let targets = scan_targets_from_build(&build_dir);
+                    let _ = sink.send(Box::new(move |siv| {
+                        if !targets.is_empty() {
+                            populate_targets(siv, targets);
+                        }
+                        set_status(siv, "Auto configure succeeded; starting build...");
+                    }));
+                }
+                RunResult::Cancelled => {
+                    let _ = sink.send(Box::new(move |siv| {
+                        set_status(siv, "Build stopped during auto configure");
+                        finish_running(siv);
+                    }));
+                    return;
+                }
+                RunResult::Failed => {
+                    let _ = sink.send(Box::new(move |siv| {
+                        set_status(siv, "Auto configure failed; build skipped");
+                        finish_running(siv);
+                    }));
+                    return;
+                }
+            }
+        }
+
         let cache = parse_cmake_cache(&build_dir.join("CMakeCache.txt"));
         let is_vs = cache
             .get("CMAKE_GENERATOR")
             .is_some_and(|g| g.contains("Visual Studio"));
+
+        if clean_first {
+            let mut clean_cmd = std::process::Command::new("cmake");
+            clean_cmd.arg("--build").arg(&build_dir).arg("--target").arg("clean");
+            if is_vs {
+                clean_cmd.arg("--config").arg(&build_type);
+            }
+            clean_cmake_env(&mut clean_cmd);
+            let clean_result = run_cmake_command(
+                &sink,
+                clean_cmd,
+                &format!("$ cmake --build {} --target clean", build_dir.to_string_lossy()),
+                Arc::clone(&stop),
+            );
+            match clean_result {
+                RunResult::Success => {
+                    let _ = sink.send(Box::new(move |siv| set_status(siv, "Clean succeeded; starting build...")));
+                }
+                RunResult::Cancelled => {
+                    let _ = sink.send(Box::new(move |siv| {
+                        set_status(siv, "Build stopped during clean");
+                        finish_running(siv);
+                    }));
+                    return;
+                }
+                RunResult::Failed => {
+                    let _ = sink.send(Box::new(move |siv| {
+                        set_status(siv, "Clean failed; build skipped");
+                        finish_running(siv);
+                    }));
+                    return;
+                }
+            }
+        }
 
         let mut cmd = std::process::Command::new("cmake");
         cmd.arg("--build").arg(&build_dir);
@@ -700,18 +1116,133 @@ fn on_build(siv: &mut Cursive) {
         if is_vs {
             cmd.arg("--config").arg(&build_type);
         }
+        cmd.arg("--parallel").arg(parallel_jobs.to_string());
         clean_cmake_env(&mut cmd);
 
-        let ok = run_cmake_command(&sink, cmd, &format!("$ cmake --build {}", build_dir.to_string_lossy()));
+        let result = run_cmake_command(
+            &sink,
+            cmd,
+            &format!("$ cmake --build {}", build_dir.to_string_lossy()),
+            stop,
+        );
 
+        let elapsed = started.elapsed();
         let _ = sink.send(Box::new(move |siv| {
-            if ok {
-                set_status(siv, format!("Build succeeded: {}", label));
-            } else {
-                set_status(siv, format!("Build failed: {}", label));
+            let secs = elapsed.as_secs_f32();
+            match result {
+                RunResult::Success => {
+                    append_output(siv, format!("Build finished in {:.2}s", secs));
+                    set_status(siv, format!("Build succeeded: {} in {:.2}s", label, secs));
+                }
+                RunResult::Cancelled => {
+                    append_output(siv, format!("Build stopped after {:.2}s", secs));
+                    set_status(siv, format!("Build stopped: {} after {:.2}s", label, secs));
+                }
+                RunResult::Failed => {
+                    append_output(siv, format!("Build failed after {:.2}s", secs));
+                    set_status(siv, format!("Build failed: {} after {:.2}s", label, secs));
+                }
             }
+            finish_running(siv);
         }));
     });
+}
+
+fn on_configure(siv: &mut Cursive) {
+    if let Some(kind) = running_kind(siv) {
+        if kind == RunKind::Configure {
+            if request_stop(siv, RunKind::Configure) {
+                set_status(siv, "Stopping configure...");
+            }
+            return;
+        }
+        set_status(siv, "Build is running; stop it first");
+        return;
+    }
+
+    start_configure_flow(siv, false);
+}
+
+fn on_build(siv: &mut Cursive) {
+    if let Some(kind) = running_kind(siv) {
+        if kind == RunKind::Build {
+            if request_stop(siv, RunKind::Build) {
+                set_status(siv, "Stopping build...");
+            }
+            return;
+        }
+        set_status(siv, "Configure is running; stop it first");
+        return;
+    }
+
+    start_build_flow(siv, false);
+}
+
+fn on_delete_and_configure(siv: &mut Cursive) {
+    if let Some(kind) = running_kind(siv) {
+        if kind == RunKind::Configure {
+            set_status(siv, "Configure is running; use Stop Configure");
+            return;
+        }
+        set_status(siv, "Build is running; stop it first");
+        return;
+    }
+
+    start_configure_flow(siv, true);
+}
+
+fn on_clean_and_build(siv: &mut Cursive) {
+    if let Some(kind) = running_kind(siv) {
+        if kind == RunKind::Build {
+            set_status(siv, "Build is running; use Stop Build");
+            return;
+        }
+        set_status(siv, "Configure is running; stop it first");
+        return;
+    }
+
+    start_build_flow(siv, true);
+}
+
+fn current_parallel_jobs(siv: &mut Cursive) -> usize {
+    siv.user_data::<UiState>()
+        .map(|s| s.app_config.parallel_jobs.max(1))
+        .unwrap_or(1)
+}
+
+fn save_parallel_jobs_from_settings(siv: &mut Cursive) {
+    let mut raw = String::new();
+    siv.call_on_name("settings_parallel_jobs", |v: &mut EditView| {
+        raw = v.get_content().to_string();
+    });
+
+    let trimmed = raw.trim();
+    let Ok(parsed) = trimmed.parse::<usize>() else {
+        siv.add_layer(Dialog::info("Parallel jobs must be a positive integer."));
+        return;
+    };
+    if parsed == 0 {
+        siv.add_layer(Dialog::info("Parallel jobs must be greater than 0."));
+        return;
+    }
+
+    if let Some(state) = siv.user_data::<UiState>() {
+        state.app_config.parallel_jobs = parsed;
+        save_app_config(&state.app_config);
+    } else {
+        let cfg = AppConfig {
+            parallel_jobs: parsed,
+            ..AppConfig::default()
+        };
+        save_app_config(&cfg);
+        siv.set_user_data(UiState {
+            app_config: cfg,
+            running: None,
+        });
+    }
+
+    siv.pop_layer();
+    set_status(siv, format!("Saved settings: parallel_jobs={parsed}"));
 }
 
 fn spawn_toolchain_scan(siv: &mut Cursive) {
@@ -739,8 +1270,20 @@ fn rescan_toolchains(siv: &mut Cursive) {
 }
 
 fn on_settings(siv: &mut Cursive) {
+    let current_jobs = current_parallel_jobs(siv);
+    let content = LinearLayout::vertical()
+        .child(TextView::new("Parallel build jobs:"))
+        .child(
+            EditView::new()
+                .content(current_jobs.to_string())
+                .with_name("settings_parallel_jobs")
+                .fixed_width(12),
+        );
+
     siv.add_layer(
-        Dialog::text("Settings")
+        Dialog::around(content)
+            .title("Settings")
+            .button("Save", save_parallel_jobs_from_settings)
             .button("Rescan Toolchains", |s| {
                 s.pop_layer();
                 rescan_toolchains(s);
@@ -753,6 +1296,11 @@ fn on_settings(siv: &mut Cursive) {
 
 fn main() {
     let mut siv = cursive::default();
+    let app_cfg = load_app_config();
+    siv.set_user_data(UiState {
+        app_config: app_cfg,
+        running: None,
+    });
 
     let toolchain = SelectView::<Toolchain>::new()
         .popup()
@@ -780,8 +1328,13 @@ fn main() {
         .child(Panel::new(target).title("Target").full_width());
 
     let actions = LinearLayout::horizontal()
-        .child(Button::new("Configure", on_configure))
-        .child(Button::new("Build", on_build));
+        .child(Button::new("Configure", on_configure).with_name("btn_configure"))
+        .child(Button::new("Build", on_build).with_name("btn_build"))
+        .child(
+            Button::new("Delete and Configure", on_delete_and_configure)
+                .with_name("btn_delete_configure"),
+        )
+        .child(Button::new("Clean and Build", on_clean_and_build).with_name("btn_clean_build"));
 
     let output = TextView::new("").with_name("output").full_width();
     let output_scroll = ScrollView::new(output)
@@ -796,7 +1349,8 @@ fn main() {
     let statusbar = LinearLayout::horizontal()
         .child(status)
         .child(Button::new("Copy Output", on_copy_output))
-        .child(Button::new("Settings", on_settings));
+        .child(Button::new("Settings", on_settings))
+        .child(Button::new("Exit", |s| s.quit()));
 
     let root = LinearLayout::vertical()
         .child(row1)
@@ -806,6 +1360,7 @@ fn main() {
         .child(statusbar);
 
     siv.add_layer(root);
+    restore_build_type_from_workspace_history(&mut siv);
 
     let cached = load_config();
     if cached.is_empty() {
@@ -824,6 +1379,7 @@ fn main() {
     } else {
         let n = targets.len();
         populate_targets(&mut siv, targets);
+        restore_target_from_workspace_history(&mut siv);
         set_status(&mut siv, format!("Found {} build target(s)", n));
     }
 

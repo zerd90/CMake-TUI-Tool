@@ -26,12 +26,152 @@ pub struct ToolchainConfig {
     pub toolchains: Vec<Toolchain>,
 }
 
-pub fn config_path() -> PathBuf {
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AppConfig {
+    pub parallel_jobs: usize,
+    #[serde(default = "default_workspace_history_limit")]
+    pub workspace_history_limit: usize,
+    #[serde(default)]
+    pub workspace_builds: HashMap<String, WorkspaceBuildConfig>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct WorkspaceBuildConfig {
+    #[serde(default)]
+    pub build_type: String,
+    #[serde(default)]
+    pub target: String,
+    #[serde(default)]
+    pub last_used_unix_secs: u64,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            parallel_jobs: host_core_count(),
+            workspace_history_limit: default_workspace_history_limit(),
+            workspace_builds: HashMap::new(),
+        }
+    }
+}
+
+fn default_workspace_history_limit() -> usize {
+    200
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn workspace_key(workspace_dir: &Path) -> String {
+    let raw = workspace_dir.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    {
+        raw.to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        raw
+    }
+}
+
+impl AppConfig {
+    fn prune_workspace_builds(&mut self) {
+        let limit = self.workspace_history_limit.max(1);
+        while self.workspace_builds.len() > limit {
+            let oldest_key = self
+                .workspace_builds
+                .iter()
+                .min_by_key(|(_, v)| v.last_used_unix_secs)
+                .map(|(k, _)| k.clone());
+            let Some(key) = oldest_key else {
+                break;
+            };
+            self.workspace_builds.remove(&key);
+        }
+    }
+
+    pub fn remember_workspace_build(
+        &mut self,
+        workspace_dir: &Path,
+        build_type: &str,
+        target: &str,
+    ) {
+        let key = workspace_key(workspace_dir);
+        self.workspace_builds.insert(
+            key,
+            WorkspaceBuildConfig {
+                build_type: build_type.to_string(),
+                target: target.to_string(),
+                last_used_unix_secs: unix_now_secs(),
+            },
+        );
+        self.prune_workspace_builds();
+    }
+
+    pub fn workspace_build(&self, workspace_dir: &Path) -> Option<&WorkspaceBuildConfig> {
+        let key = workspace_key(workspace_dir);
+        self.workspace_builds.get(&key)
+    }
+
+    pub fn normalize(&mut self) {
+        if self.parallel_jobs == 0 {
+            self.parallel_jobs = host_core_count();
+        }
+        if self.workspace_history_limit == 0 {
+            self.workspace_history_limit = default_workspace_history_limit();
+        }
+        self.prune_workspace_builds();
+    }
+}
+
+fn host_core_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+fn config_dir() -> PathBuf {
     let exe = std::env::current_exe().unwrap_or_default();
-    exe.parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("config")
-        .join("toolchain.json")
+    exe.parent().unwrap_or_else(|| Path::new(".")).join("config")
+}
+
+pub fn app_config_path() -> PathBuf {
+    config_dir().join("config.json")
+}
+
+pub fn config_path() -> PathBuf {
+    config_dir().join("toolchain.json")
+}
+
+pub fn load_app_config() -> AppConfig {
+    let path = app_config_path();
+    let loaded = match std::fs::read_to_string(&path) {
+        Ok(s) => serde_json::from_str::<AppConfig>(&s).ok(),
+        Err(_) => None,
+    };
+
+    let mut cfg = loaded.unwrap_or_default();
+    cfg.normalize();
+
+    if !path.exists() {
+        save_app_config(&cfg);
+    }
+
+    cfg
+}
+
+pub fn save_app_config(cfg: &AppConfig) {
+    let path = app_config_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(cfg) {
+        let _ = std::fs::write(path, s);
+    }
 }
 
 pub fn load_config() -> Vec<Toolchain> {
