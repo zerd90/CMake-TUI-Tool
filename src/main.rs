@@ -2,13 +2,19 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
 use std::process::Stdio;
+use std::process::exit;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(unix)]
+use std::time::Duration;
+
+use cursive::event::Event;
+use cursive::theme::{BaseColor, BorderStyle, Color, PaletteColor, Theme};
 use cursive::traits::{Nameable, Resizable};
 use cursive::views::{
-    Button, Dialog, EditView, LinearLayout, NamedView, Panel, ResizedView, ScrollView, SelectView,
+    Button, Dialog, DummyView, EditView, LinearLayout, NamedView, Panel, ScrollView, SelectView,
     TextView,
 };
 use cursive::{CbSink, Cursive};
@@ -18,6 +24,20 @@ use cmake_tui_tool::{
     parse_cmake_cache, save_app_config, save_config, scan_toolchains, AppConfig, Toolchain,
 };
 use cmake_tui_tool::runtime::{RunResult, run_command_with_cancel};
+
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+#[cfg(windows)]
+use windows_sys::Win32::System::Console::{
+    CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetStdHandle, STD_OUTPUT_HANDLE,
+};
+
+#[cfg(unix)]
+use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RunKind {
@@ -33,6 +53,271 @@ struct RunningState {
 struct UiState {
     app_config: AppConfig,
     running: Option<RunningState>,
+    exit_notice: Option<String>,
+}
+
+type OutputScrollNamedView = NamedView<ScrollView<NamedView<TextView>>>;
+
+const MIN_TERMINAL_HEIGHT: usize = 16;
+
+fn terminal_height() -> Option<usize> {
+    crossterm::terminal::size().ok().map(|(_, h)| h as usize)
+}
+
+fn reject_startup_if_too_small() {
+    if let Some(height) = terminal_height()
+        && height < MIN_TERMINAL_HEIGHT {
+            eprintln!(
+                "Terminal height is too small: {height}. Need at least {MIN_TERMINAL_HEIGHT} rows."
+            );
+            exit(1);
+        }
+}
+
+fn enforce_terminal_height_policy(siv: &mut Cursive, height: usize) {
+    if height < MIN_TERMINAL_HEIGHT {
+        let msg = format!(
+            "Terminal height {height} is below minimum {MIN_TERMINAL_HEIGHT}; exiting"
+        );
+        if let Some(state) = siv.user_data::<UiState>() {
+            state.exit_notice = Some(msg.clone());
+        }
+        set_status(
+            siv,
+            msg,
+        );
+        siv.quit();
+    }
+}
+
+fn workspace_leaf_name() -> String {
+    let dir = std::env::current_dir().unwrap_or_default();
+    dir.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "workspace".to_string())
+}
+
+fn resolve_project_name() -> String {
+    let project_dir = std::env::current_dir().unwrap_or_default();
+    let cache = parse_cmake_cache(&project_dir.join("build").join("CMakeCache.txt"));
+    cache
+        .get("CMAKE_PROJECT_NAME")
+        .filter(|name| !name.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(workspace_leaf_name)
+}
+
+fn refresh_project_name_line(siv: &mut Cursive) {
+    let name = resolve_project_name();
+    siv.call_on_name("project_name", |v: &mut TextView| {
+        v.set_content(format!("Project: {name}"));
+    });
+}
+
+#[cfg(windows)]
+fn detect_terminal_background_color() -> Option<Color> {
+    let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
+
+    let ok = unsafe { GetConsoleScreenBufferInfo(handle, &mut info) };
+    if ok == 0 {
+        return None;
+    }
+
+    let bg = (info.wAttributes >> 4) & 0x0f;
+    let intense = (bg & 0b1000) != 0;
+    let rgb = bg & 0b0111;
+
+    let base = match rgb {
+        0 => BaseColor::Black,
+        1 => BaseColor::Blue,
+        2 => BaseColor::Green,
+        3 => BaseColor::Cyan,
+        4 => BaseColor::Red,
+        5 => BaseColor::Magenta,
+        6 => BaseColor::Yellow,
+        _ => BaseColor::White,
+    };
+
+    Some(if intense {
+        Color::Light(base)
+    } else {
+        Color::Dark(base)
+    })
+}
+
+#[cfg(all(unix, not(windows)))]
+fn detect_terminal_background_color() -> Option<Color> {
+    detect_bg_from_colorfgbg().or_else(detect_bg_from_osc11)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn detect_terminal_background_color() -> Option<Color> {
+    None
+}
+
+#[cfg(unix)]
+fn color_from_ansi_index(index: u8) -> Color {
+    let base = match index & 0b111 {
+        0 => BaseColor::Black,
+        1 => BaseColor::Red,
+        2 => BaseColor::Green,
+        3 => BaseColor::Yellow,
+        4 => BaseColor::Blue,
+        5 => BaseColor::Magenta,
+        6 => BaseColor::Cyan,
+        _ => BaseColor::White,
+    };
+    if (index & 0b1000) != 0 {
+        Color::Light(base)
+    } else {
+        Color::Dark(base)
+    }
+}
+
+#[cfg(unix)]
+fn detect_bg_from_colorfgbg() -> Option<Color> {
+    let value = std::env::var("COLORFGBG").ok()?;
+    let bg = value
+        .split(';')
+        .next_back()?
+        .trim()
+        .parse::<u8>()
+        .ok()?;
+    (bg <= 15).then(|| color_from_ansi_index(bg))
+}
+
+#[cfg(unix)]
+fn scale_hex_channel_to_u8(hex: &str) -> Option<u8> {
+    if hex.is_empty() || hex.len() > 4 {
+        return None;
+    }
+    let value = u16::from_str_radix(hex, 16).ok()? as u32;
+    let max = ((1u32 << (hex.len() * 4)) - 1).max(1);
+    Some(((value * 255) / max) as u8)
+}
+
+#[cfg(unix)]
+fn parse_osc11_rgb(reply: &str) -> Option<Color> {
+    let start = reply.find("rgb:")? + 4;
+    let mut tail = &reply[start..];
+    if let Some(i) = tail.find('\u{7}') {
+        tail = &tail[..i];
+    }
+    if let Some(i) = tail.find("\x1b\\") {
+        tail = &tail[..i];
+    }
+    let mut parts = tail.split('/');
+    let r = scale_hex_channel_to_u8(parts.next()?.trim())?;
+    let g = scale_hex_channel_to_u8(parts.next()?.trim())?;
+    let b = scale_hex_channel_to_u8(parts.next()?.trim())?;
+    Some(Color::Rgb(r, g, b))
+}
+
+#[cfg(unix)]
+struct TermiosGuard {
+    fd: i32,
+    original: libc::termios,
+    active: bool,
+}
+
+#[cfg(unix)]
+impl Drop for TermiosGuard {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe {
+                let _ = libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn detect_bg_from_osc11() -> Option<Color> {
+    let mut tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .ok()?;
+    let fd = tty.as_raw_fd();
+
+    let mut original: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
+        return None;
+    }
+    let mut raw = original;
+    unsafe {
+        libc::cfmakeraw(&mut raw);
+    }
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+        return None;
+    }
+    let _guard = TermiosGuard {
+        fd,
+        original,
+        active: true,
+    };
+
+    if tty.write_all(b"\x1b]11;?\x07").is_err() || tty.flush().is_err() {
+        return None;
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(180);
+    let mut data = Vec::new();
+    while Instant::now() < deadline {
+        let remain = (deadline - Instant::now()).as_millis().min(60) as i32;
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let polled = unsafe { libc::poll(&mut pfd, 1, remain) };
+        if polled <= 0 {
+            continue;
+        }
+
+        let mut buf = [0u8; 256];
+        let n = tty.read(&mut buf).ok()?;
+        if n == 0 {
+            continue;
+        }
+        data.extend_from_slice(&buf[..n]);
+
+        if data.windows(2).any(|w| w == b"\x1b\\") || data.contains(&0x07) {
+            break;
+        }
+    }
+
+    if data.is_empty() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&data);
+    parse_osc11_rgb(&text)
+}
+
+fn apply_ui_theme(siv: &mut Cursive) {
+    let mut theme = Theme::default();
+    theme.shadow = false;
+    theme.borders = BorderStyle::Simple;
+
+    let bg = detect_terminal_background_color().unwrap_or(Color::Dark(BaseColor::Black));
+
+    theme.palette[PaletteColor::Background] = bg;
+    theme.palette[PaletteColor::View] = bg;
+    theme.palette[PaletteColor::Primary] = Color::Light(BaseColor::White);
+    theme.palette[PaletteColor::Secondary] = Color::Light(BaseColor::Cyan);
+    theme.palette[PaletteColor::TitlePrimary] = Color::Light(BaseColor::Cyan);
+    theme.palette[PaletteColor::TitleSecondary] = Color::Light(BaseColor::Green);
+    theme.palette[PaletteColor::Highlight] = Color::Dark(BaseColor::Cyan);
+    theme.palette[PaletteColor::HighlightInactive] = bg;
+    theme.palette[PaletteColor::HighlightText] = Color::Dark(BaseColor::Black);
+
+    siv.set_theme(theme);
 }
 
 fn populate_toolchains(siv: &mut Cursive, list: Vec<Toolchain>) {
@@ -414,12 +699,9 @@ fn append_output(siv: &mut Cursive, line: impl Into<String>) {
         content.push('\n');
         v.set_content(content);
     });
-    siv.call_on_name(
-        "output_scroll",
-        |v: &mut ScrollView<ResizedView<NamedView<TextView>>>| {
-            v.scroll_to_bottom();
-        },
-    );
+    siv.call_on_name("output_scroll", |v: &mut OutputScrollNamedView| {
+        v.get_mut().scroll_to_bottom();
+    });
 }
 
 fn reset_action_buttons(siv: &mut Cursive) {
@@ -764,6 +1046,7 @@ fn start_configure_flow(siv: &mut Cursive, delete_build_dir_first: bool) {
                 };
                 let _ = sink.send(Box::new(move |siv| {
                     populate_targets_preserve(siv, targets, prev);
+                    refresh_project_name_line(siv);
                     let secs = elapsed.as_secs_f32();
                     append_output(siv, format!("Configure finished in {:.2}s", secs));
                     set_status(siv, format!("Configure succeeded: {} target(s) in {:.2}s", n, secs));
@@ -1056,6 +1339,7 @@ fn save_parallel_jobs_from_settings(siv: &mut Cursive) {
         siv.set_user_data(UiState {
             app_config: cfg,
             running: None,
+            exit_notice: None,
         });
     }
 
@@ -1113,12 +1397,19 @@ fn on_settings(siv: &mut Cursive) {
 }
 
 fn main() {
+    reject_startup_if_too_small();
+
     let mut siv = cursive::default();
+    apply_ui_theme(&mut siv);
+
     let app_cfg = load_app_config();
     siv.set_user_data(UiState {
         app_config: app_cfg,
         running: None,
+        exit_notice: None,
     });
+
+    let project_name = TextView::new("Project: ...").with_name("project_name").full_width();
 
     let toolchain = SelectView::<Toolchain>::new()
         .popup()
@@ -1143,41 +1434,71 @@ fn main() {
 
     let row2 = LinearLayout::horizontal()
         .child(Panel::new(build_type).title("Build Type").full_width())
+        .child(DummyView.fixed_width(1))
         .child(Panel::new(target).title("Target").full_width());
 
     let actions = LinearLayout::horizontal()
         .child(Button::new("Configure", on_configure).with_name("btn_configure"))
+        .child(DummyView.fixed_width(1))
         .child(Button::new("Build", on_build).with_name("btn_build"))
+        .child(DummyView.fixed_width(1))
         .child(
             Button::new("Delete and Configure", on_delete_and_configure)
                 .with_name("btn_delete_configure"),
         )
+        .child(DummyView.fixed_width(1))
         .child(Button::new("Clean and Build", on_clean_and_build).with_name("btn_clean_build"));
 
-    let output = TextView::new("").with_name("output").full_width();
-    let output_scroll = ScrollView::new(output)
-        .with_name("output_scroll")
+    let action_panel = Panel::new(actions).title("Actions").full_width();
+
+    let output = TextView::new("").with_name("output");
+    let output_scroll = ScrollView::new(output).with_name("output_scroll");
+    let output_panel = Panel::new(output_scroll)
+        .title("Build Output")
+        .with_name("output_panel")
         .full_height();
 
-    let status = TextView::new("Ready")
+    let status = TextView::new("Ready | Waiting for action")
         .no_wrap()
         .with_name("status")
         .full_width();
 
     let statusbar = LinearLayout::horizontal()
         .child(status)
+        .child(DummyView.fixed_width(1))
         .child(Button::new("Copy Output", on_copy_output))
+        .child(DummyView.fixed_width(1))
         .child(Button::new("Settings", on_settings))
+        .child(DummyView.fixed_width(1))
         .child(Button::new("Exit", |s| s.quit()));
 
+    let status_panel = Panel::new(statusbar).title("Status").full_width();
+
     let root = LinearLayout::vertical()
+        .child(project_name)
         .child(row1)
         .child(row2)
-        .child(actions)
-        .child(output_scroll)
-        .child(statusbar);
+        .child(action_panel)
+        .child(output_panel)
+        .child(status_panel);
 
-    siv.add_layer(root);
+    siv.add_fullscreen_layer(root);
+    siv.set_fps(4);
+    siv.add_global_callback(Event::WindowResize, |s| {
+        let h = s.screen_size().y;
+        enforce_terminal_height_policy(s, h);
+    });
+    siv.add_global_callback(Event::Refresh, |s| {
+        if let Some(height) = terminal_height() {
+            enforce_terminal_height_policy(s, height);
+        }
+    });
+
+    if let Some(height) = terminal_height() {
+        enforce_terminal_height_policy(&mut siv, height);
+    }
+
+    refresh_project_name_line(&mut siv);
     restore_build_type_from_workspace_history(&mut siv);
 
     let cached = load_config();
@@ -1202,6 +1523,13 @@ fn main() {
     }
 
     siv.run();
+
+    let exit_notice = siv
+        .user_data::<UiState>()
+        .and_then(|state| state.exit_notice.clone());
+    if let Some(msg) = exit_notice {
+        println!("{msg}");
+    }
 }
 
 #[cfg(test)]
