@@ -38,18 +38,33 @@ Pick a toolchain, build type and target, then press **Configure** and **Build**.
 ### Interaction
 
 - Use Cursive's standard keyboard navigation to move focus and select options.
-- Trigger actions through the bottom action buttons (`Configure`, `Build`,
-  `Delete and Configure`, `Clean and Build`, `Copy Output`, `Settings`,
-  `Exit`).
+- Open the command panel (`p`) to run `Configure`, `Build`,
+  `Delete and Configure`, or `Clean and Build`.
+- Use the status bar buttons for copy, settings, command panel, and exit.
+
+### Keyboard shortcuts
+
+- `p`: open command panel
+- `Esc`: close command panel or settings window
+- `g`: focus and open toolchain dropdown
+- `b`: focus and open build type dropdown
+- `t`: focus and open target dropdown
+- `c`: copy current build output
+- `s`: open settings window
+- `q`: quit application
 
 ### Config files
 
-Config files are stored next to the executable under `config/`:
+Config files are stored under the platform config directory in `cmake-tui-tool/`:
 
-- `config/toolchain.json`: detected toolchain cache
-- `config/config.json`: app settings and workspace build history
+- Linux example: `~/.config/cmake-tui-tool/`
+- macOS example: `~/Library/Application Support/cmake-tui-tool/`
+- Windows example: `%APPDATA%\\cmake-tui-tool\\`
 
-`config/config.json` currently includes:
+- `toolchain.json`: detected toolchain cache
+- `config.json`: app settings and workspace build history
+
+`config.json` currently includes:
 
 - `parallel_jobs`
 - `workspace_history_limit`
@@ -60,7 +75,6 @@ Config files are stored next to the executable under `config/`:
 ```sh
 cargo run --bin scan -- scan                     # list detected toolchains
 cargo run --bin scan -- scan --json              # machine-readable JSON
-cargo run --bin scan -- benchmark [--kits PATH]  # compare vs cmake-tools-kits.json
 ```
 
 ## Build

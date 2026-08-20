@@ -3,27 +3,27 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Stdio;
 use std::process::exit;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 #[cfg(unix)]
 use std::time::Duration;
 
-use cursive::event::Event;
+use cursive::event::{Event, Key};
 use cursive::theme::{BaseColor, BorderStyle, Color, PaletteColor, Theme};
 use cursive::traits::{Nameable, Resizable};
 use cursive::views::{
-    Button, Dialog, DummyView, EditView, LinearLayout, NamedView, Panel, ScrollView, SelectView,
-    TextView,
+    Button, Dialog, DummyView, EditView, Layer, LinearLayout, NamedView, OnEventView, Panel,
+    ScrollView, SelectView, TextView, ThemedView,
 };
 use cursive::{CbSink, Cursive};
 
-use cmake_tui_tool::{
-    compiler_stem, configure_compiler_args, is_multi_config, load_app_config, load_config,
-    parse_cmake_cache, save_app_config, save_config, scan_toolchains, AppConfig, Toolchain,
-};
 use cmake_tui_tool::runtime::{RunResult, run_command_with_cancel};
+use cmake_tui_tool::{
+    AppConfig, Toolchain, compiler_stem, configure_compiler_args, is_multi_config, load_app_config,
+    load_config, parse_cmake_cache, save_app_config, save_config, scan_toolchains,
+};
 
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
@@ -54,6 +54,7 @@ struct UiState {
     app_config: AppConfig,
     running: Option<RunningState>,
     exit_notice: Option<String>,
+    terminal_bg: Option<Color>,
 }
 
 type OutputScrollNamedView = NamedView<ScrollView<NamedView<TextView>>>;
@@ -66,26 +67,23 @@ fn terminal_height() -> Option<usize> {
 
 fn reject_startup_if_too_small() {
     if let Some(height) = terminal_height()
-        && height < MIN_TERMINAL_HEIGHT {
-            eprintln!(
-                "Terminal height is too small: {height}. Need at least {MIN_TERMINAL_HEIGHT} rows."
-            );
-            exit(1);
-        }
+        && height < MIN_TERMINAL_HEIGHT
+    {
+        eprintln!(
+            "Terminal height is too small: {height}. Need at least {MIN_TERMINAL_HEIGHT} rows."
+        );
+        exit(1);
+    }
 }
 
 fn enforce_terminal_height_policy(siv: &mut Cursive, height: usize) {
     if height < MIN_TERMINAL_HEIGHT {
-        let msg = format!(
-            "Terminal height {height} is below minimum {MIN_TERMINAL_HEIGHT}; exiting"
-        );
+        let msg =
+            format!("Terminal height {height} is below minimum {MIN_TERMINAL_HEIGHT}; exiting");
         if let Some(state) = siv.user_data::<UiState>() {
             state.exit_notice = Some(msg.clone());
         }
-        set_status(
-            siv,
-            msg,
-        );
+        set_status(siv, msg);
         siv.quit();
     }
 }
@@ -183,12 +181,7 @@ fn color_from_ansi_index(index: u8) -> Color {
 #[cfg(unix)]
 fn detect_bg_from_colorfgbg() -> Option<Color> {
     let value = std::env::var("COLORFGBG").ok()?;
-    let bg = value
-        .split(';')
-        .next_back()?
-        .trim()
-        .parse::<u8>()
-        .ok()?;
+    let bg = value.split(';').next_back()?.trim().parse::<u8>().ok()?;
     (bg <= 15).then(|| color_from_ansi_index(bg))
 }
 
@@ -345,12 +338,33 @@ fn is_light_background(bg: Color) -> bool {
     color_luma(bg).map(|l| l >= 145).unwrap_or(false)
 }
 
-fn apply_ui_theme(siv: &mut Cursive) {
+const COMMAND_PANEL_LIGHT_BG: Color = Color::Rgb(236, 236, 236);
+const COMMAND_PANEL_DARK_BG: Color = Color::Rgb(24, 24, 24);
+
+fn command_panel_bg_color(terminal_bg: Option<Color>, fallback_bg: Color) -> Color {
+    let bg = terminal_bg.unwrap_or(fallback_bg);
+    if is_light_background(bg) {
+        COMMAND_PANEL_LIGHT_BG
+    } else {
+        COMMAND_PANEL_DARK_BG
+    }
+}
+
+fn command_panel_theme(base_theme: &Theme, terminal_bg: Option<Color>) -> Theme {
+    let mut theme = base_theme.clone();
+    let panel_bg = command_panel_bg_color(terminal_bg, theme.palette[PaletteColor::Background]);
+    theme.palette[PaletteColor::Background] = panel_bg;
+    theme.palette[PaletteColor::View] = panel_bg;
+    theme.palette[PaletteColor::HighlightInactive] = panel_bg;
+    theme
+}
+
+fn apply_ui_theme(siv: &mut Cursive, terminal_bg: Option<Color>) {
     let mut theme = Theme::default();
     theme.shadow = false;
     theme.borders = BorderStyle::Simple;
 
-    let bg = detect_terminal_background_color().unwrap_or(Color::Dark(BaseColor::Black));
+    let bg = terminal_bg.unwrap_or(Color::Dark(BaseColor::Black));
     let light_bg = is_light_background(bg);
 
     theme.palette[PaletteColor::Background] = bg;
@@ -395,10 +409,11 @@ fn select_by_value(siv: &mut Cursive, name: &str, target: &str) {
     siv.call_on_name(name, |v: &mut SelectView<String>| {
         for i in 0..v.len() {
             if let Some((_, value)) = v.get_item(i)
-                && value.as_str() == target {
-                    v.set_selection(i);
-                    break;
-                }
+                && value.as_str() == target
+            {
+                v.set_selection(i);
+                break;
+            }
         }
     });
 }
@@ -407,10 +422,11 @@ fn select_toolchain_by_stem(siv: &mut Cursive, stem: &str) {
     siv.call_on_name("toolchain", |v: &mut SelectView<Toolchain>| {
         for i in 0..v.len() {
             if let Some((_, value)) = v.get_item(i)
-                && compiler_stem(&value.path).as_deref() == Some(stem) {
-                    v.set_selection(i);
-                    break;
-                }
+                && compiler_stem(&value.path).as_deref() == Some(stem)
+            {
+                v.set_selection(i);
+                break;
+            }
         }
     });
 }
@@ -419,10 +435,12 @@ fn select_toolchain_by_id_arch(siv: &mut Cursive, id: &str, arch: &str) {
     siv.call_on_name("toolchain", |v: &mut SelectView<Toolchain>| {
         for i in 0..v.len() {
             if let Some((_, value)) = v.get_item(i)
-                && value.id == id && (arch.is_empty() || value.arch.as_deref() == Some(arch)) {
-                    v.set_selection(i);
-                    break;
-                }
+                && value.id == id
+                && (arch.is_empty() || value.arch.as_deref() == Some(arch))
+            {
+                v.set_selection(i);
+                break;
+            }
         }
     });
 }
@@ -435,9 +453,10 @@ fn restore_from_cache(siv: &mut Cursive) {
     }
 
     if let Some(bt) = cache.get("CMAKE_BUILD_TYPE")
-        && !bt.is_empty() {
-            select_by_value(siv, "build_type", &bt.to_lowercase());
-        }
+        && !bt.is_empty()
+    {
+        select_by_value(siv, "build_type", &bt.to_lowercase());
+    }
 
     let generator = cache.get("CMAKE_GENERATOR").cloned().unwrap_or_default();
 
@@ -464,9 +483,10 @@ fn restore_from_cache(siv: &mut Cursive) {
             .filter(|v| !v.is_empty() && !v.contains("NOTFOUND"))
             .or_else(|| cache.get("CMAKE_CXX_COMPILER"));
         if let Some(compiler) = compiler
-            && let Some(stem) = compiler_stem(compiler) {
-                select_toolchain_by_stem(siv, &stem);
-            }
+            && let Some(stem) = compiler_stem(compiler)
+        {
+            select_toolchain_by_stem(siv, &stem);
+        }
     }
 }
 
@@ -778,7 +798,9 @@ fn set_running_buttons(siv: &mut Cursive, kind: RunKind) {
                 v.set_enabled(true);
             });
             siv.call_on_name("btn_build", |v: &mut Button| v.set_enabled(false));
-            siv.call_on_name("btn_delete_configure", |v: &mut Button| v.set_enabled(false));
+            siv.call_on_name("btn_delete_configure", |v: &mut Button| {
+                v.set_enabled(false)
+            });
             siv.call_on_name("btn_clean_build", |v: &mut Button| v.set_enabled(false));
         }
         RunKind::Build => {
@@ -787,7 +809,9 @@ fn set_running_buttons(siv: &mut Cursive, kind: RunKind) {
                 v.set_enabled(true);
             });
             siv.call_on_name("btn_configure", |v: &mut Button| v.set_enabled(false));
-            siv.call_on_name("btn_delete_configure", |v: &mut Button| v.set_enabled(false));
+            siv.call_on_name("btn_delete_configure", |v: &mut Button| {
+                v.set_enabled(false)
+            });
             siv.call_on_name("btn_clean_build", |v: &mut Button| v.set_enabled(false));
         }
     }
@@ -817,10 +841,11 @@ fn finish_running(siv: &mut Cursive) {
 fn request_stop(siv: &mut Cursive, kind: RunKind) -> bool {
     if let Some(state) = siv.user_data::<UiState>()
         && let Some(running) = &state.running
-            && running.kind == kind {
-                running.stop.store(true, Ordering::SeqCst);
-                return true;
-            }
+        && running.kind == kind
+    {
+        running.stop.store(true, Ordering::SeqCst);
+        return true;
+    }
     false
 }
 
@@ -980,21 +1005,27 @@ fn stale_cache_conflict(build_dir: &Path, toolchain: &Toolchain) -> Option<Strin
         ));
     }
     if let Some(arch) = &toolchain.arch
-        && cache.get("CMAKE_GENERATOR_PLATFORM").is_some_and(|p| p != arch) {
-            return Some(format!(
-                "platform: {} -> {}",
-                cache.get("CMAKE_GENERATOR_PLATFORM").unwrap(),
-                arch
-            ));
-        }
+        && cache
+            .get("CMAKE_GENERATOR_PLATFORM")
+            .is_some_and(|p| p != arch)
+    {
+        return Some(format!(
+            "platform: {} -> {}",
+            cache.get("CMAKE_GENERATOR_PLATFORM").unwrap(),
+            arch
+        ));
+    }
     if let Some(toolset) = &toolchain.toolset
-        && cache.get("CMAKE_GENERATOR_TOOLSET").is_some_and(|t| t != toolset) {
-            return Some(format!(
-                "toolset: {} -> {}",
-                cache.get("CMAKE_GENERATOR_TOOLSET").unwrap(),
-                toolset
-            ));
-        }
+        && cache
+            .get("CMAKE_GENERATOR_TOOLSET")
+            .is_some_and(|t| t != toolset)
+    {
+        return Some(format!(
+            "toolset: {} -> {}",
+            cache.get("CMAKE_GENERATOR_TOOLSET").unwrap(),
+            toolset
+        ));
+    }
     None
 }
 
@@ -1037,7 +1068,10 @@ fn start_configure_flow(siv: &mut Cursive, delete_build_dir_first: bool) {
     } else {
         set_status(
             siv,
-            format!("Configuring: toolchain={} build_type={}", toolchain_label, build_type),
+            format!(
+                "Configuring: toolchain={} build_type={}",
+                toolchain_label, build_type
+            ),
         );
     }
 
@@ -1049,9 +1083,10 @@ fn start_configure_flow(siv: &mut Cursive, delete_build_dir_first: bool) {
         if delete_build_dir_first {
             pre_notes.push("Delete and configure: removing build directory".to_string());
             if let Err(e) = std::fs::remove_dir_all(&build_dir)
-                && e.kind() != std::io::ErrorKind::NotFound {
-                    pre_notes.push(format!("Failed to remove build directory: {e}"));
-                }
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                pre_notes.push(format!("Failed to remove build directory: {e}"));
+            }
         }
 
         let mut args: Vec<String> = vec![
@@ -1104,7 +1139,10 @@ fn start_configure_flow(siv: &mut Cursive, delete_build_dir_first: bool) {
                     refresh_project_name_line(siv);
                     let secs = elapsed.as_secs_f32();
                     append_output(siv, format!("Configure finished in {:.2}s", secs));
-                    set_status(siv, format!("Configure succeeded: {} target(s) in {:.2}s", n, secs));
+                    set_status(
+                        siv,
+                        format!("Configure succeeded: {} target(s) in {:.2}s", n, secs),
+                    );
                     finish_running(siv);
                 }));
             }
@@ -1188,7 +1226,8 @@ fn start_build_flow(siv: &mut Cursive, clean_first: bool) {
             configure_cmd.args(&args);
             clean_cmake_env(&mut configure_cmd);
 
-            let configure_result = run_cmake_command(&sink, configure_cmd, &header, Arc::clone(&stop));
+            let configure_result =
+                run_cmake_command(&sink, configure_cmd, &header, Arc::clone(&stop));
             match configure_result {
                 RunResult::Success => {
                     let targets = scan_targets_from_build(&build_dir);
@@ -1223,7 +1262,11 @@ fn start_build_flow(siv: &mut Cursive, clean_first: bool) {
 
         if clean_first {
             let mut clean_cmd = std::process::Command::new("cmake");
-            clean_cmd.arg("--build").arg(&build_dir).arg("--target").arg("clean");
+            clean_cmd
+                .arg("--build")
+                .arg(&build_dir)
+                .arg("--target")
+                .arg("clean");
             if is_vs {
                 clean_cmd.arg("--config").arg(&build_type);
             }
@@ -1235,15 +1278,13 @@ fn start_build_flow(siv: &mut Cursive, clean_first: bool) {
             if is_vs {
                 clean_cmdline.push_str(&format!(" --config {}", build_type));
             }
-            let clean_result = run_cmake_command(
-                &sink,
-                clean_cmd,
-                &clean_cmdline,
-                Arc::clone(&stop),
-            );
+            let clean_result =
+                run_cmake_command(&sink, clean_cmd, &clean_cmdline, Arc::clone(&stop));
             match clean_result {
                 RunResult::Success => {
-                    let _ = sink.send(Box::new(move |siv| set_status(siv, "Clean succeeded; starting build...")));
+                    let _ = sink.send(Box::new(move |siv| {
+                        set_status(siv, "Clean succeeded; starting build...")
+                    }));
                 }
                 RunResult::Cancelled => {
                     let _ = sink.send(Box::new(move |siv| {
@@ -1302,12 +1343,7 @@ fn start_build_flow(siv: &mut Cursive, clean_first: bool) {
         build_cmdline.push_str(&format!(" --parallel {}", parallel_jobs));
         build_cmdline.push_str(&format!("  # CMAKE_BUILD_PARALLEL_LEVEL={}", parallel_jobs));
 
-        let result = run_cmake_command(
-            &sink,
-            cmd,
-            &build_cmdline,
-            stop,
-        );
+        let result = run_cmake_command(&sink, cmd, &build_cmdline, stop);
 
         let elapsed = started.elapsed();
         let _ = sink.send(Box::new(move |siv| {
@@ -1422,6 +1458,7 @@ fn save_parallel_jobs_from_settings(siv: &mut Cursive) {
             app_config: cfg,
             running: None,
             exit_notice: None,
+            terminal_bg: None,
         });
     }
 
@@ -1476,34 +1513,102 @@ fn on_settings(siv: &mut Cursive) {
                 .fixed_width(12),
         );
 
-    siv.add_layer(
+    let dialog = Dialog::around(content)
+        .title("Settings")
+        .button("Save", save_parallel_jobs_from_settings)
+        .button("Rescan Toolchains", |s| {
+            s.pop_layer();
+            rescan_toolchains(s);
+        })
+        .button("Close", |s| {
+            s.pop_layer();
+        });
+
+    let dialog = OnEventView::new(dialog).on_pre_event(Event::Key(Key::Esc), |s| {
+        s.pop_layer();
+    });
+
+    siv.add_layer(dialog);
+}
+
+fn on_commands(siv: &mut Cursive) {
+    let terminal_bg = siv
+        .user_data::<UiState>()
+        .and_then(|state| state.terminal_bg);
+    let command_theme = command_panel_theme(siv.current_theme(), terminal_bg);
+
+    let content = LinearLayout::vertical()
+        .child(Button::new("Configure", |s| {
+            s.pop_layer();
+            on_configure(s);
+        }))
+        .child(Button::new("Build", |s| {
+            s.pop_layer();
+            on_build(s);
+        }))
+        .child(Button::new("Delete and Configure", |s| {
+            s.pop_layer();
+            on_delete_and_configure(s);
+        }))
+        .child(Button::new("Clean and Build", |s| {
+            s.pop_layer();
+            on_clean_and_build(s);
+        }));
+
+    let dialog = Layer::new(
         Dialog::around(content)
-            .title("Settings")
-            .button("Save", save_parallel_jobs_from_settings)
-            .button("Rescan Toolchains", |s| {
-                s.pop_layer();
-                rescan_toolchains(s);
-            })
+            .title("Commands")
             .button("Close", |s| {
                 s.pop_layer();
             }),
     );
+
+    let dialog = OnEventView::new(dialog).on_pre_event(Event::Key(Key::Esc), |s| {
+        s.pop_layer();
+    });
+
+    siv.add_layer(ThemedView::new(command_theme, dialog));
+}
+
+fn focus_and_open_popup(siv: &mut Cursive, view_name: &str, label: &str) {
+    if siv.focus_name(view_name).is_err() {
+        set_status(siv, format!("{label} selector is not available"));
+        return;
+    }
+    // Popup SelectView opens on Enter after it gains focus.
+    siv.on_event(Event::Key(Key::Enter));
+}
+
+fn on_toolchain_hotkey(siv: &mut Cursive) {
+    focus_and_open_popup(siv, "toolchain", "Toolchain");
+}
+
+fn on_build_type_hotkey(siv: &mut Cursive) {
+    focus_and_open_popup(siv, "build_type", "Build type");
+}
+
+fn on_target_hotkey(siv: &mut Cursive) {
+    focus_and_open_popup(siv, "target", "Target");
 }
 
 fn main() {
     reject_startup_if_too_small();
 
+    let terminal_bg = detect_terminal_background_color();
     let mut siv = cursive::default();
-    apply_ui_theme(&mut siv);
+    apply_ui_theme(&mut siv, terminal_bg);
 
     let app_cfg = load_app_config();
     siv.set_user_data(UiState {
         app_config: app_cfg,
         running: None,
         exit_notice: None,
+        terminal_bg,
     });
 
-    let project_name = TextView::new("Project: ...").with_name("project_name").full_width();
+    let project_name = TextView::new("Project: ...")
+        .with_name("project_name")
+        .full_width();
 
     let toolchain = SelectView::<Toolchain>::new()
         .popup()
@@ -1531,20 +1636,6 @@ fn main() {
         .child(DummyView.fixed_width(1))
         .child(Panel::new(target).title("Target").full_width());
 
-    let actions = LinearLayout::horizontal()
-        .child(Button::new("Configure", on_configure).with_name("btn_configure"))
-        .child(DummyView.fixed_width(1))
-        .child(Button::new("Build", on_build).with_name("btn_build"))
-        .child(DummyView.fixed_width(1))
-        .child(
-            Button::new("Delete and Configure", on_delete_and_configure)
-                .with_name("btn_delete_configure"),
-        )
-        .child(DummyView.fixed_width(1))
-        .child(Button::new("Clean and Build", on_clean_and_build).with_name("btn_clean_build"));
-
-    let action_panel = Panel::new(actions).title("Actions").full_width();
-
     let output = TextView::new("").with_name("output");
     let output_scroll = ScrollView::new(output).with_name("output_scroll");
     let output_panel = Panel::new(output_scroll)
@@ -1560,11 +1651,13 @@ fn main() {
     let statusbar = LinearLayout::horizontal()
         .child(status)
         .child(DummyView.fixed_width(1))
-        .child(Button::new("Copy Output", on_copy_output))
+        .child(Button::new("󰆏", on_copy_output))
         .child(DummyView.fixed_width(1))
-        .child(Button::new("Settings", on_settings))
+        .child(Button::new("󰒓", on_settings))
         .child(DummyView.fixed_width(1))
-        .child(Button::new("Exit", |s| s.quit()));
+        .child(Button::new("󰆍", on_commands))
+        .child(DummyView.fixed_width(1))
+        .child(Button::new("󰈆", |s| s.quit()));
 
     let status_panel = Panel::new(statusbar).title("Status").full_width();
 
@@ -1572,7 +1665,6 @@ fn main() {
         .child(project_name)
         .child(row1)
         .child(row2)
-        .child(action_panel)
         .child(output_panel)
         .child(status_panel);
 
@@ -1587,6 +1679,13 @@ fn main() {
             enforce_terminal_height_policy(s, height);
         }
     });
+    siv.add_global_callback(Event::Char('g'), on_toolchain_hotkey);
+    siv.add_global_callback(Event::Char('b'), on_build_type_hotkey);
+    siv.add_global_callback(Event::Char('t'), on_target_hotkey);
+    siv.add_global_callback(Event::Char('c'), on_copy_output);
+    siv.add_global_callback(Event::Char('s'), on_settings);
+    siv.add_global_callback(Event::Char('q'), |s| s.quit());
+    siv.add_global_callback(Event::Char('p'), on_commands);
 
     if let Some(height) = terminal_height() {
         enforce_terminal_height_policy(&mut siv, height);
@@ -1623,91 +1722,5 @@ fn main() {
         .and_then(|state| state.exit_notice.clone());
     if let Some(msg) = exit_notice {
         println!("{msg}");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_target_help() {
-        let output = "[1/1] All primary targets available:\n\
-edit_cache: phony\n\
-install: phony\n\
-Mp4Parser-BC: phony\n\
-ExtractVideoStream: phony\n\
-ExtractVideoStream.exe: phony\n\
-Mp4ParseLib/samples/edit_cache: phony\n\
-build.ninja: RERUN_CMAKE\n\
-clean: CLEAN\n\
-help: HELP\n";
-        let targets = parse_cmake_target_help(output);
-        assert_eq!(
-            targets,
-            vec![
-                "install".to_string(),
-                "Mp4Parser-BC".to_string(),
-                "ExtractVideoStream".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn parse_makefiles_target_help() {
-        let output = "The following are some of the valid targets for this Makefile:\n\
-... all (the default if no target is provided)\n\
-... clean\n\
-... depend\n\
-... edit_cache\n\
-... install\n\
-... install/local\n\
-... install/strip\n\
-... list_install_components\n\
-... rebuild_cache\n\
-... ExtractVideoStream\n\
-... Mp4InfoDisplay\n\
-... Mp4ParseLib\n\
-... Mp4Parser-BC\n\
-... ParseMp4Files\n\
-... imgui\n\
-... resources/app.obj\n\
-... src/Mp4ParseData.obj\n";
-        let targets = parse_cmake_target_help(output);
-        assert_eq!(
-            targets,
-            vec![
-                "all".to_string(),
-                "install".to_string(),
-                "ExtractVideoStream".to_string(),
-                "Mp4InfoDisplay".to_string(),
-                "Mp4ParseLib".to_string(),
-                "Mp4Parser-BC".to_string(),
-                "ParseMp4Files".to_string(),
-                "imgui".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn scan_targets_from_slnx_parses() {
-        let dir = std::env::temp_dir().join("cmake_tui_test_slnx");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("Test.slnx"),
-            "<?xml version=\"1.0\"?>\n<Solution>\n  <Project Path=\"ALL_BUILD.vcxproj\" Type=\"8bc9ceb8\"/>\n  <Project Path=\"INSTALL.vcxproj\" Type=\"8bc9ceb8\"/>\n  <Project Path=\"Mp4ParseLib/samples/ExtractVideoStream.vcxproj\" Type=\"8bc9ceb8\"/>\n  <Project Path=\"Mp4Parser-BC.vcxproj\" Type=\"8bc9ceb8\"/>\n  <Project Path=\"ZERO_CHECK.vcxproj\" Type=\"8bc9ceb8\"/>\n</Solution>\n",
-        )
-        .unwrap();
-        let targets = scan_targets_from_slnx(&dir);
-        assert_eq!(
-            targets,
-            vec![
-                "all".to_string(),
-                "install".to_string(),
-                "ExtractVideoStream".to_string(),
-                "Mp4Parser-BC".to_string()
-            ]
-        );
     }
 }

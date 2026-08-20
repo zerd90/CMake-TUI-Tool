@@ -92,18 +92,24 @@ pub fn run_command_with_cancel(
     on_line: Arc<dyn Fn(String) + Send + Sync>,
 ) -> std::io::Result<RunResult> {
     prepare_cancellable_command(&mut cmd);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
 
     let mut child = cmd.spawn()?;
 
     let mut readers = Vec::new();
     if let Some(stdout) = child.stdout.take() {
         let on_line = Arc::clone(&on_line);
-        readers.push(std::thread::spawn(move || read_stream_lines(stdout, on_line)));
+        readers.push(std::thread::spawn(move || {
+            read_stream_lines(stdout, on_line)
+        }));
     }
     if let Some(stderr) = child.stderr.take() {
         let on_line = Arc::clone(&on_line);
-        readers.push(std::thread::spawn(move || read_stream_lines(stderr, on_line)));
+        readers.push(std::thread::spawn(move || {
+            read_stream_lines(stderr, on_line)
+        }));
     }
 
     let mut cancelled = false;

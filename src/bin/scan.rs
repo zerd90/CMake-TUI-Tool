@@ -50,8 +50,14 @@ fn scan(args: &[String]) {
                 extra.push_str(&format!("  toolset={tool}"));
             }
             match &t.cxx {
-                Some(cxx) => println!("[{:8}] {:16} {:12} {}  (cxx: {}){}", t.id, t.name, t.version, t.path, cxx, extra),
-                None => println!("[{:8}] {:16} {:12} {}{}", t.id, t.name, t.version, t.path, extra),
+                Some(cxx) => println!(
+                    "[{:8}] {:16} {:12} {}  (cxx: {}){}",
+                    t.id, t.name, t.version, t.path, cxx, extra
+                ),
+                None => println!(
+                    "[{:8}] {:16} {:12} {}{}",
+                    t.id, t.name, t.version, t.path, extra
+                ),
             }
         }
         println!("\n{} toolchain(s) found", found.len());
@@ -61,9 +67,10 @@ fn scan(args: &[String]) {
 fn kits_path_from_args(args: &[String]) -> String {
     for (i, a) in args.iter().enumerate() {
         if a == "--kits"
-            && let Some(p) = args.get(i + 1) {
-                return p.clone();
-            }
+            && let Some(p) = args.get(i + 1)
+        {
+            return p.clone();
+        }
     }
     DEFAULT_KITS.to_string()
 }
@@ -121,9 +128,18 @@ fn benchmark(args: &[String]) {
         }
     }
 
-    let matched: Vec<&String> = ref_paths.iter().filter(|p| scan_paths.contains(*p)).collect();
-    let missing: Vec<&String> = ref_paths.iter().filter(|p| !scan_paths.contains(*p)).collect();
-    let extra: Vec<&String> = scan_paths.iter().filter(|p| !ref_paths.contains(*p)).collect();
+    let matched: Vec<&String> = ref_paths
+        .iter()
+        .filter(|p| scan_paths.contains(*p))
+        .collect();
+    let missing: Vec<&String> = ref_paths
+        .iter()
+        .filter(|p| !scan_paths.contains(*p))
+        .collect();
+    let extra: Vec<&String> = scan_paths
+        .iter()
+        .filter(|p| !ref_paths.contains(*p))
+        .collect();
 
     // MSVC host/target combos.
     let ref_msvc: BTreeSet<String> = kits
@@ -146,14 +162,25 @@ fn benchmark(args: &[String]) {
     }
 
     println!("\n=== Benchmark vs {} ===", kits_path);
-    println!("reference kits: {} (gcc={}, clang={}, msvc={})",
+    println!(
+        "reference kits: {} (gcc={}, clang={}, msvc={})",
         kits.len(),
-        kits.iter().filter(|k| family_of_kit(&k.name) == "gcc").count(),
-        kits.iter().filter(|k| family_of_kit(&k.name) == "clang").count(),
-        kits.iter().filter(|k| family_of_kit(&k.name) == "msvc").count(),
+        kits.iter()
+            .filter(|k| family_of_kit(&k.name) == "gcc")
+            .count(),
+        kits.iter()
+            .filter(|k| family_of_kit(&k.name) == "clang")
+            .count(),
+        kits.iter()
+            .filter(|k| family_of_kit(&k.name) == "msvc")
+            .count(),
     );
 
-    println!("\n[compiler paths] reference={} scanned={}", ref_paths.len(), scan_paths.len());
+    println!(
+        "\n[compiler paths] reference={} scanned={}",
+        ref_paths.len(),
+        scan_paths.len()
+    );
     println!("  matched: {}", matched.len());
     for p in &matched {
         println!("    OK   {}", p);
@@ -174,18 +201,30 @@ fn benchmark(args: &[String]) {
         println!("          paths are implicit in the reference VS kits, so they appear extra.");
     }
 
-    println!("\n[MSVC host/target combos] reference={} scanned={}", ref_msvc.len(), scan_msvc.len());
+    println!(
+        "\n[MSVC host/target combos] reference={} scanned={}",
+        ref_msvc.len(),
+        scan_msvc.len()
+    );
     let ms_match = ref_msvc.intersection(&scan_msvc).count();
     println!("  matched combos: {}", ms_match);
     if !ref_msvc.is_empty() {
         for c in &ref_msvc {
-            let ok = if scan_msvc.contains(c) { "OK  " } else { "MISS" };
+            let ok = if scan_msvc.contains(c) {
+                "OK  "
+            } else {
+                "MISS"
+            };
             println!("    {} {}", ok, c);
         }
     }
 
     let total = ref_paths.len();
     if total > 0 {
-        println!("\n=== Coverage: {}/{} unique reference compiler paths ===", matched.len(), total);
+        println!(
+            "\n=== Coverage: {}/{} unique reference compiler paths ===",
+            matched.len(),
+            total
+        );
     }
 }
