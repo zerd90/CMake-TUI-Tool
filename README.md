@@ -52,6 +52,7 @@ Pick a toolchain, build type and target, then press **Configure** and **Build**.
 - `c`: copy current build output
 - `s`: open settings window
 - `q`: quit application
+- `i`: stop configure/build
 
 ### Config files
 

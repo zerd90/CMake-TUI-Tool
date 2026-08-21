@@ -390,16 +390,34 @@ fn apply_ui_theme(siv: &mut Cursive, terminal_bg: Option<Color>) {
 }
 
 fn populate_toolchains(siv: &mut Cursive, list: Vec<Toolchain>) {
+    let labels: Vec<_> = list
+        .into_iter()
+        .map(|tc| {
+            let name = format!("{} ({})", tc.name, tc.version);
+            let arch = tc
+                .triple
+                .as_deref()
+                .or(tc.arch.as_deref())
+                .unwrap_or("-")
+                .to_string();
+            (name, arch, tc)
+        })
+        .collect();
+    let name_width = labels
+        .iter()
+        .map(|(name, _, _)| name.len())
+        .max()
+        .unwrap_or(0);
+    let arch_width = labels
+        .iter()
+        .map(|(_, arch, _)| arch.len())
+        .max()
+        .unwrap_or(0);
+
     siv.call_on_name("toolchain", |v: &mut SelectView<Toolchain>| {
         v.clear();
-        for tc in list {
-            let mut label = format!("{} ({})", tc.name, tc.version);
-            if let Some(tri) = &tc.triple {
-                label.push_str(&format!(" [{}]", tri));
-            } else if let Some(a) = &tc.arch {
-                label.push_str(&format!(" [{}]", a));
-            }
-            label.push_str(&format!("  {}", tc.path));
+        for (name, arch, tc) in labels {
+            let label = format!("{name:<name_width$}  {arch:<arch_width$}  {}", tc.path);
             v.add_item(label, tc);
         }
     });
@@ -780,41 +798,11 @@ fn append_output(siv: &mut Cursive, line: impl Into<String>) {
 }
 
 fn reset_action_buttons(siv: &mut Cursive) {
-    siv.call_on_name("btn_configure", |v: &mut Button| {
-        v.set_label("Configure");
-        v.set_enabled(true);
-    });
-    siv.call_on_name("btn_build", |v: &mut Button| {
-        v.set_label("Build");
-        v.set_enabled(true);
-    });
+    siv.call_on_name("btn_stop", |v: &mut Button| v.set_enabled(false));
 }
 
-fn set_running_buttons(siv: &mut Cursive, kind: RunKind) {
-    match kind {
-        RunKind::Configure => {
-            siv.call_on_name("btn_configure", |v: &mut Button| {
-                v.set_label("Stop Configure");
-                v.set_enabled(true);
-            });
-            siv.call_on_name("btn_build", |v: &mut Button| v.set_enabled(false));
-            siv.call_on_name("btn_delete_configure", |v: &mut Button| {
-                v.set_enabled(false)
-            });
-            siv.call_on_name("btn_clean_build", |v: &mut Button| v.set_enabled(false));
-        }
-        RunKind::Build => {
-            siv.call_on_name("btn_build", |v: &mut Button| {
-                v.set_label("Stop Build");
-                v.set_enabled(true);
-            });
-            siv.call_on_name("btn_configure", |v: &mut Button| v.set_enabled(false));
-            siv.call_on_name("btn_delete_configure", |v: &mut Button| {
-                v.set_enabled(false)
-            });
-            siv.call_on_name("btn_clean_build", |v: &mut Button| v.set_enabled(false));
-        }
-    }
+fn set_running_buttons(siv: &mut Cursive) {
+    siv.call_on_name("btn_stop", |v: &mut Button| v.set_enabled(true));
 }
 
 fn start_running(siv: &mut Cursive, kind: RunKind) -> Arc<AtomicBool> {
@@ -825,7 +813,7 @@ fn start_running(siv: &mut Cursive, kind: RunKind) -> Arc<AtomicBool> {
             stop: Arc::clone(&stop),
         });
     }
-    set_running_buttons(siv, kind);
+    set_running_buttons(siv);
     stop
 }
 
@@ -834,8 +822,6 @@ fn finish_running(siv: &mut Cursive) {
         state.running = None;
     }
     reset_action_buttons(siv);
-    siv.call_on_name("btn_delete_configure", |v: &mut Button| v.set_enabled(true));
-    siv.call_on_name("btn_clean_build", |v: &mut Button| v.set_enabled(true));
 }
 
 fn request_stop(siv: &mut Cursive, kind: RunKind) -> bool {
@@ -847,6 +833,19 @@ fn request_stop(siv: &mut Cursive, kind: RunKind) -> bool {
         return true;
     }
     false
+}
+
+fn on_stop(siv: &mut Cursive) {
+    if let Some(kind) = running_kind(siv)
+        && request_stop(siv, kind)
+    {
+        let command = match kind {
+            RunKind::Configure => "configure",
+            RunKind::Build => "build",
+        };
+        set_status(siv, format!("Stopping {command}..."));
+        siv.call_on_name("btn_stop", |v: &mut Button| v.set_enabled(false));
+    }
 }
 
 fn running_kind(siv: &mut Cursive) -> Option<RunKind> {
@@ -1511,18 +1510,26 @@ fn on_settings(siv: &mut Cursive) {
                 .on_edit(on_parallel_jobs_edit)
                 .with_name("settings_parallel_jobs")
                 .fixed_width(12),
+        )
+        .child(DummyView.fixed_height(1))
+        .child(
+            LinearLayout::horizontal()
+                .child(Button::new_raw(
+                    "[ Save ]",
+                    save_parallel_jobs_from_settings,
+                ))
+                .child(DummyView.fixed_width(1))
+                .child(Button::new_raw("[ Rescan Toolchains ]", |s| {
+                    s.pop_layer();
+                    rescan_toolchains(s);
+                }))
+                .child(DummyView.fixed_width(1))
+                .child(Button::new_raw("[ Close ]", |s| {
+                    s.pop_layer();
+                })),
         );
 
-    let dialog = Dialog::around(content)
-        .title("Settings")
-        .button("Save", save_parallel_jobs_from_settings)
-        .button("Rescan Toolchains", |s| {
-            s.pop_layer();
-            rescan_toolchains(s);
-        })
-        .button("Close", |s| {
-            s.pop_layer();
-        });
+    let dialog = Dialog::around(content).title("Settings");
 
     let dialog = OnEventView::new(dialog).on_pre_event(Event::Key(Key::Esc), |s| {
         s.pop_layer();
@@ -1537,31 +1544,40 @@ fn on_commands(siv: &mut Cursive) {
         .and_then(|state| state.terminal_bg);
     let command_theme = command_panel_theme(siv.current_theme(), terminal_bg);
 
+    let running = running_kind(siv).is_some();
+    let mut configure = Button::new_raw("[ Configure ]", |s| {
+        s.pop_layer();
+        on_configure(s);
+    });
+    configure.set_enabled(!running);
+    let mut build = Button::new_raw("[ Build ]", |s| {
+        s.pop_layer();
+        on_build(s);
+    });
+    build.set_enabled(!running);
+    let mut delete_configure = Button::new_raw("[ Delete and Configure ]", |s| {
+        s.pop_layer();
+        on_delete_and_configure(s);
+    });
+    delete_configure.set_enabled(!running);
+    let mut clean_build = Button::new_raw("[ Clean and Build ]", |s| {
+        s.pop_layer();
+        on_clean_and_build(s);
+    });
+    clean_build.set_enabled(!running);
     let content = LinearLayout::vertical()
-        .child(Button::new("Configure", |s| {
-            s.pop_layer();
-            on_configure(s);
-        }))
-        .child(Button::new("Build", |s| {
-            s.pop_layer();
-            on_build(s);
-        }))
-        .child(Button::new("Delete and Configure", |s| {
-            s.pop_layer();
-            on_delete_and_configure(s);
-        }))
-        .child(Button::new("Clean and Build", |s| {
-            s.pop_layer();
-            on_clean_and_build(s);
-        }));
+        .child(configure)
+        .child(build)
+        .child(delete_configure)
+        .child(clean_build);
 
-    let dialog = Layer::new(
-        Dialog::around(content)
-            .title("Commands")
-            .button("Close", |s| {
-                s.pop_layer();
-            }),
-    );
+    let content = LinearLayout::vertical()
+        .child(content)
+        .child(DummyView.fixed_height(1))
+        .child(Button::new_raw("[ Close ]", |s| {
+            s.pop_layer();
+        }));
+    let dialog = Layer::new(Dialog::around(content).title("Commands"));
 
     let dialog = OnEventView::new(dialog).on_pre_event(Event::Key(Key::Esc), |s| {
         s.pop_layer();
@@ -1651,13 +1667,19 @@ fn main() {
     let statusbar = LinearLayout::horizontal()
         .child(status)
         .child(DummyView.fixed_width(1))
-        .child(Button::new("󰆏", on_copy_output))
+        .child(
+            Button::new_raw("[ Stop ]", on_stop)
+                .disabled()
+                .with_name("btn_stop"),
+        )
         .child(DummyView.fixed_width(1))
-        .child(Button::new("󰒓", on_settings))
+        .child(Button::new_raw("[ 󰆏 ]", on_copy_output))
         .child(DummyView.fixed_width(1))
-        .child(Button::new("󰆍", on_commands))
+        .child(Button::new_raw("[ 󰒓 ]", on_settings))
         .child(DummyView.fixed_width(1))
-        .child(Button::new("󰈆", |s| s.quit()));
+        .child(Button::new_raw("[ 󰆍 ]", on_commands))
+        .child(DummyView.fixed_width(1))
+        .child(Button::new_raw("[ 󰈆 ]", |s| s.quit()));
 
     let status_panel = Panel::new(statusbar).title("Status").full_width();
 
@@ -1686,6 +1708,7 @@ fn main() {
     siv.add_global_callback(Event::Char('s'), on_settings);
     siv.add_global_callback(Event::Char('q'), |s| s.quit());
     siv.add_global_callback(Event::Char('p'), on_commands);
+    siv.add_global_callback(Event::Char('i'), on_stop);
 
     if let Some(height) = terminal_height() {
         enforce_terminal_height_policy(&mut siv, height);
